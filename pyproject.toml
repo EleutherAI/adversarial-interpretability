@@ -15,6 +15,6 @@ chess_probe = [
 ]
 
 [tool.uv.sources]
-searchless-chess = { path = "environments/chess_probe/vendor/searchless_chess/src" }
+searchless-chess = { path = "environments/chess_probe/vendor/searchless_chess" }
 
 

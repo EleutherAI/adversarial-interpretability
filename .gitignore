@@ -100,3 +100,4 @@ transformers_cache/
 datasets_cache/
 hf_cache/
 
+uv.lock
