@@ -1,0 +1,20 @@
+[project]
+name = "adversarial-interpretability"
+version = "0.0.0"
+description = "Research repo"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+[tool.uv]
+default-groups = []
+
+[dependency-groups]
+chess_probe = [
+  "searchless-chess",
+]
+
+[tool.uv.sources]
+searchless-chess = { path = "environments/chess_probe/vendor/searchless_chess/src" }
+
+
