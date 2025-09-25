@@ -101,3 +101,8 @@ datasets_cache/
 hf_cache/
 
 uv.lock
+
+prototype/
+results/
+figures/
+*/prototype.py
