@@ -1,0 +1,6 @@
+Vendored from google-deepmind/searchless_chess
+Source path: /mnt/ssd-1/david/chess_spy
+Commit: 90ae0e6b121673fc3079aaeffa047580bb600c0a
+Date: 2025-09-25T02:44:24Z
+License: Apache-2.0 (see LICENSE)
+Notes: Preserved original headers; this copy is for chess_probe environment integration.
