@@ -88,15 +88,6 @@ Licensing
 - Install uv (Linux/macOS):
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-- Verify installation:
-```bash
-uv --version
-```
-
-- Initial environment setup (once `pyproject.toml` exists at the repo root):
-```bash
 uv sync
 ```
 This creates a local virtual environment (e.g., `.venv/`) and installs the base project dependencies.
