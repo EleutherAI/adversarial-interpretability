@@ -23,6 +23,7 @@ import json
 import math
 import os
 from dataclasses import asdict, dataclass
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -36,6 +37,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _VENDOR_ROOT = _REPO_ROOT / "environments/chess_probe/vendor"
 import sys  # noqa: E402
 
+# Ensure repo root is importable (so `libs.*` works when running by absolute path)
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.append(str(_REPO_ROOT))
 if str(_VENDOR_ROOT) not in sys.path:
     sys.path.append(str(_VENDOR_ROOT))
 
@@ -110,6 +114,14 @@ def _build_examples_text() -> str:
         lines.append(f"Move (UCI): {move}")
         lines.append(f"Why: {why}")
     return "\n".join(lines)
+
+
+def _slugify(text: str) -> str:
+    """Make a filesystem-safe slug for filenames/dirs.
+
+    Keeps alnum, underscore, dot, dash; replaces others with '-'.
+    """
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", text)
 
 
 def build_plain_prompt(fen: str) -> str:
@@ -385,14 +397,6 @@ def main() -> None:
         default=str(_REPO_ROOT / "results" / "chess_probe"),
     )
     parser.add_argument(
-        "--run_dir",
-        type=str,
-        default=None,
-        help=(
-            "If set, use an existing run directory (created by an orchestrator) and do not write config/metadata."
-        ),
-    )
-    parser.add_argument(
         "--lora_adapter_path",
         type=str,
         default=None,
@@ -416,16 +420,11 @@ def main() -> None:
     args = parser.parse_args()
 
     # Standardized run scaffolding
-    if args.run_dir:
-        run_dir = Path(args.run_dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        # Ensure expected subdirectories exist
-        (Path(run_dir) / "metrics").mkdir(parents=True, exist_ok=True)
-    else:
-        base_results_dir = Path(args.results_dir)
-        run_dir = start_run(base_dir=base_results_dir, run_prefix="qwen_bc_eval")
-        write_config_yaml(run_dir, args)
-        capture_metadata(run_dir)
+    base_results_dir = Path(args.results_dir)
+    model_slug = _slugify(args.model_name_or_path)
+    run_dir = start_run(base_dir=base_results_dir, run_prefix=f"{model_slug}_eval")
+    write_config_yaml(run_dir, f"{sys.executable} " + " ".join(sys.argv), vars(args))
+    capture_metadata(run_dir)
 
     device = torch.device(args.device)
     tokenizer = AutoTokenizer.from_pretrained(
@@ -463,7 +462,7 @@ def main() -> None:
     pretokenized_moves = precompute_candidate_token_ids(tokenizer)
 
     per_fen: List[BCPerFenMetrics] = []
-    jsonl_path = Path(run_dir) / "metrics" / "qwen_bc_eval.jsonl"
+    jsonl_path = Path(run_dir) / "metrics" / f"{model_slug}_eval.jsonl"
     jsonl_f = open(jsonl_path, "w") if args.save_jsonl else None
 
     try:
@@ -495,7 +494,7 @@ def main() -> None:
         **{f"eval_{k}": v for k, v in agg.items()},
     }
 
-    out_path = Path(run_dir) / "metrics" / "qwen_bc_eval_summary.json"
+    out_path = Path(run_dir) / "metrics" / f"{model_slug}_eval_summary.json"
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
 

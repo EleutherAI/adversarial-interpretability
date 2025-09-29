@@ -35,6 +35,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _VENDOR_ROOT = _REPO_ROOT / "environments/chess_probe/vendor"
 import sys  # noqa: E402
 
+# Ensure repo root is importable (so `libs.*` works when running by absolute path)
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.append(str(_REPO_ROOT))
 if str(_VENDOR_ROOT) not in sys.path:
     sys.path.append(str(_VENDOR_ROOT))
 
@@ -300,7 +303,7 @@ def main() -> None:
     training_output_dir.mkdir(parents=True, exist_ok=True)
     # Overwrite args.output_dir to artifacts path for Trainer
     args.output_dir = str(training_output_dir)
-    write_config_yaml(run_dir, args)
+    write_config_yaml(run_dir, f"{sys.executable} " + " ".join(sys.argv), vars(args))
     capture_metadata(run_dir)
 
     torch.manual_seed(args.seed)

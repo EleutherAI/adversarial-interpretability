@@ -33,16 +33,16 @@ def main() -> None:
     # Write the full config (including resolved run_dir) into the run folder
     enriched = dict(cfg)
     enriched["run_dir"] = str(run_dir)
-    write_config_yaml(run_dir, enriched)
+    write_config_yaml(run_dir, command, enriched)
     capture_metadata(run_dir, extra={"config_runner": True})
 
     # Build argument list
-    cmdline = [sys.executable] if command.endswith(".py") and " " not in command else []
-    if cmdline:
-        cmdline.append(command)
+    # Normalize command to a tokenized argv and ensure interpreter for .py files
+    tokens = command.split()
+    if tokens and tokens[0].endswith(".py"):
+        cmdline = [sys.executable] + tokens
     else:
-        # raw shell-like command; split minimal by space
-        cmdline = command.split()
+        cmdline = tokens
 
     # Expand args
     args_section = cfg.get("args", {})

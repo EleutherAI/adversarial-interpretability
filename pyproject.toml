@@ -22,6 +22,7 @@ default-groups = []
 chess_probe = [
   "searchless-chess",
   "python-chess",
+  "flax"
 ]
 
 [tool.uv.sources]

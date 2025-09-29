@@ -90,11 +90,22 @@ def _coerce(obj: Any) -> Any:
 
 
 def _pip_freeze() -> Optional[List[str]]:
+    # Try pip freeze first
     text = _run([sys.executable, "-m", "pip", "freeze"])
-    if text is None:
+    if text:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return lines
+    # Fallback to importlib.metadata if pip is not available in the runtime
+    try:
+        try:
+            import importlib.metadata as im  # type: ignore
+        except Exception:  # pragma: no cover
+            import importlib_metadata as im  # type: ignore
+        pkgs = [f"{d.metadata['Name']}=={d.version}" for d in im.distributions() if d.metadata.get('Name')]
+        pkgs = sorted({p for p in pkgs})
+        return pkgs
+    except Exception:
         return None
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return lines
 
 
 def ensure_run_dir(run_dir: Path | str, create_subdirs: bool = True, subdirs: Optional[List[str]] = None) -> Path:
@@ -121,10 +132,29 @@ def start_run(base_dir: Path | str, run_prefix: Optional[str] = None, include_gi
     return ensure_run_dir(run_path, create_subdirs=create_subdirs, subdirs=subdirs)
 
 
-def write_config_yaml(run_dir: Path | str, args: Any, filename: str = "config.yaml") -> Path:
+def write_config_yaml(
+    run_dir: Path | str,
+    command: str,
+    args: Any,
+    filename: str = "config.yaml",
+) -> Path:
+    """Write a configuration YAML capturing the exact command and arguments.
+
+    Behavior:
+      - If args is a simple mapping/namespace, writes {command: ..., args: {...}}
+      - If args is a mapping that already includes structured sections (e.g., from an orchestrator),
+        it preserves the structure and just ensures 'command' is present/updated.
+    """
     run_path = Path(run_dir)
     config_path = run_path / filename
-    payload = _coerce(args)
+    coerced = _coerce(args)
+
+    if isinstance(coerced, Mapping):
+        payload: Dict[str, Any] = dict(coerced)
+        payload["command"] = command
+    else:
+        payload = {"command": command, "args": coerced}
+
     with open(config_path, "w") as f:
         yaml.safe_dump(payload, f, sort_keys=False)
     return config_path
