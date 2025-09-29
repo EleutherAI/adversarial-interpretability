@@ -101,3 +101,9 @@ datasets_cache/
 hf_cache/
 
 uv.lock
+
+.venv/
+results/
+
+environments/chess_probe/vendor/searchless_chess/data/
+environments/chess_probe/vendor/searchless_chess/BayesElo/

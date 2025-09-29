@@ -26,7 +26,11 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["searchless_chess", "searchless_chess.src"]
+packages = [
+  "searchless_chess",
+  "searchless_chess.src",
+  "searchless_chess.src.engines",
+]
 
 [tool.setuptools.package-dir]
 "searchless_chess" = "."
