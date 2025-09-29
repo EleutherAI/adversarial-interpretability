@@ -11,7 +11,8 @@ dependencies = [
   "torch",
   "transformers",
   "tqdm",
-  "peft"
+  "peft",
+  "PyYAML"
 ]
 
 [tool.uv]

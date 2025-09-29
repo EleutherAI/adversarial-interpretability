@@ -7,6 +7,7 @@ Scope
 Non-goals
 - Forcing similar model architectures or training code across all experiments.
 - Over-abstracting before concrete use cases exist.
+- Standardised analysis for all experiements - just want some consistency in final presentation (plots/tables)
 
 Directory layout
 - docs/
@@ -49,6 +50,29 @@ Results and experiment tracking
   - On startup: create the run directory, copy the config, write `metadata.json`
   - During training/eval: append metrics to `metrics.jsonl`, write plots and artifacts under the run directory
 - Remote trackers: optionally mirror metrics to W&B or MLflow, but the filesystem record above is the source of truth for reproducibility.
+
+### Config runner
+
+Run any experiment from a YAML file; a fresh run directory is created and the full config is recorded.
+
+```bash
+uv run python scripts/config_runner.py --config configs/examples/my_eval.yaml
+```
+
+YAML shape:
+
+```yaml
+command: environments/chess_probe/scripts/eval_qwen_bc.py
+args:
+  model_name_or_path: Qwen/Qwen3-8B-Base
+  num_eval_data: 200
+  results_dir: results/chess_probe
+  save_jsonl: true
+```
+
+The runner injects `run_dir` for downstream scripts (available as `--run_dir` if supported, otherwise in env as RUN_DIR).
+
+
 
 Add a new environment
 1) Create environments/<env_name>/ with a README.md describing assumptions and dependencies.

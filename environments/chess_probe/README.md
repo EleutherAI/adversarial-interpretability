@@ -18,3 +18,32 @@ Licensing
 
 References
 - Chen, H., Vondrick, C., Mao, C. (2024). SelfIE: Self-Interpretation of Large Language Model Embeddings. arXiv. [arXiv:2403.10949v2](https://arxiv.org/pdf/2403.10949v2)
+
+## Running Qwen BC eval and training
+
+Launch vLLM and run the eval in one shot, with a single config recorded:
+
+```bash
+uv run python scripts/orchestrate_qwen_bc_eval.py \
+  --model_name_or_path Qwen/Qwen3-8B-Base \
+  --vllm_port 8000 \
+  --num_eval_data 200 --save_jsonl
+```
+
+This creates a run directory and writes a combined `config.yaml` that includes vLLM and eval args. Logs are under `logs/`.
+
+What gets created:
+
+```
+results/chess_probe/
+  qwen_bc_eval-YYYYMMDD-HHMMSS-<git>/
+    config.yaml
+    metadata.json
+    logs/
+    plots/
+    artifacts/
+    samples/
+    metrics/
+      qwen_bc_eval_summary.json
+      qwen_bc_eval.jsonl
+```

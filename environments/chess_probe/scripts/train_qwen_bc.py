@@ -11,7 +11,7 @@ Defaults:
 - num training examples: 2000
 
 Example:
-  python scripts/train_qwen_bc.py \
+  python environments/chess_probe/scripts/train_qwen_bc.py \
     --model_name_or_path Qwen/Qwen3-8B-Base \
     --dataset_path environments/chess_probe/vendor/searchless_chess/data/train/behavioral_cloning_data.bag \
     --num_train_data 2000 \
@@ -31,7 +31,7 @@ import torch
 from torch.utils.data import Dataset
 
 # Ensure vendored searchless_chess package can be imported as `searchless_chess.*`
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 _VENDOR_ROOT = _REPO_ROOT / "environments/chess_probe/vendor"
 import sys  # noqa: E402
 
@@ -48,6 +48,8 @@ from peft import LoraConfig, get_peft_model  # noqa: E402
 
 from searchless_chess.src import bagz  # noqa: E402
 from searchless_chess.src import constants as slc_constants  # noqa: E402
+
+from libs.run_utils import capture_metadata, start_run, write_config_yaml  # noqa: E402
 
 
 # Few-shot examples to improve instruction following for base models.
@@ -291,6 +293,16 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Standardized run scaffolding
+    run_dir = start_run(base_dir=Path(args.output_dir).parent, run_prefix="qwen_bc_train")
+    # Ensure the HF trainer writes inside the run directory's artifacts
+    training_output_dir = Path(run_dir) / "artifacts"
+    training_output_dir.mkdir(parents=True, exist_ok=True)
+    # Overwrite args.output_dir to artifacts path for Trainer
+    args.output_dir = str(training_output_dir)
+    write_config_yaml(run_dir, args)
+    capture_metadata(run_dir)
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -386,5 +398,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 

@@ -32,7 +32,7 @@ import torch
 from tqdm import tqdm
 
 # Ensure vendored searchless_chess package can be imported as `searchless_chess.*`
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 _VENDOR_ROOT = _REPO_ROOT / "environments/chess_probe/vendor"
 import sys  # noqa: E402
 
@@ -47,6 +47,8 @@ from searchless_chess.src import utils as slc_utils  # noqa: E402
 from searchless_chess.src.engines import engine as slc_engine  # noqa: E402
 
 import chess  # noqa: E402
+
+from libs.run_utils import capture_metadata, start_run, write_config_yaml  # noqa: E402
 
 
 @dataclass
@@ -113,7 +115,7 @@ def _build_examples_text() -> str:
 def build_plain_prompt(fen: str) -> str:
     """Plain prompt; no trailing space before the move."""
     return (
-        "Stockfish is a powerful chess engine. It can be used to recommend the best move for a given chess position.\n" 
+        "Stockfish is a powerful chess engine. It can be used to recommend the best move for a given chess position.\n"
         "Input format: a chess position in FEN.\n"
         "Output format: the best legal move in UCI format only (e.g., e2e4 or e7e8q).\n"
         "Example:\n"
@@ -383,6 +385,14 @@ def main() -> None:
         default=str(_REPO_ROOT / "results" / "chess_probe"),
     )
     parser.add_argument(
+        "--run_dir",
+        type=str,
+        default=None,
+        help=(
+            "If set, use an existing run directory (created by an orchestrator) and do not write config/metadata."
+        ),
+    )
+    parser.add_argument(
         "--lora_adapter_path",
         type=str,
         default=None,
@@ -405,8 +415,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    results_dir = Path(args.results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
+    # Standardized run scaffolding
+    if args.run_dir:
+        run_dir = Path(args.run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # Ensure expected subdirectories exist
+        (Path(run_dir) / "metrics").mkdir(parents=True, exist_ok=True)
+    else:
+        base_results_dir = Path(args.results_dir)
+        run_dir = start_run(base_dir=base_results_dir, run_prefix="qwen_bc_eval")
+        write_config_yaml(run_dir, args)
+        capture_metadata(run_dir)
 
     device = torch.device(args.device)
     tokenizer = AutoTokenizer.from_pretrained(
@@ -444,7 +463,7 @@ def main() -> None:
     pretokenized_moves = precompute_candidate_token_ids(tokenizer)
 
     per_fen: List[BCPerFenMetrics] = []
-    jsonl_path = results_dir / "qwen_bc_eval.jsonl"
+    jsonl_path = Path(run_dir) / "metrics" / "qwen_bc_eval.jsonl"
     jsonl_f = open(jsonl_path, "w") if args.save_jsonl else None
 
     try:
@@ -476,7 +495,7 @@ def main() -> None:
         **{f"eval_{k}": v for k, v in agg.items()},
     }
 
-    out_path = results_dir / "qwen_bc_eval_summary.json"
+    out_path = Path(run_dir) / "metrics" / "qwen_bc_eval_summary.json"
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -485,5 +504,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
