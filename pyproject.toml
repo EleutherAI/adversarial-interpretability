@@ -1,5 +1,5 @@
 [project]
-name = "adversarial-interpretability"
+name = "modelscope"
 version = "0.0.0"
 description = "Research repo"
 readme = "README.md"
