@@ -12,7 +12,10 @@ dependencies = [
   "transformers",
   "tqdm",
   "peft",
-  "PyYAML"
+  "PyYAML",
+  "searchless-chess",
+  "deepspeed>=0.17.6",
+  "wandb>=0.22.1",
 ]
 
 [tool.uv]
@@ -22,10 +25,19 @@ default-groups = []
 chess_probe = [
   "searchless-chess",
   "python-chess",
-  "flax"
+  "dm-haiku",
+  "flax",
+  "orbax-checkpoint",
+  "chex",
+  "jax[cuda12]>=0.6.2",
 ]
 
 [tool.uv.sources]
-searchless-chess = { path = "environments/chess_probe/vendor/searchless_chess" }
+searchless-chess = { workspace = true, editable = true }
+
+[tool.uv.workspace]
+members = [
+    "environments/chess_probe/vendor/searchless_chess",
+]
 
 

@@ -30,31 +30,31 @@ import orbax.checkpoint as ocp
 from searchless_chess.src import constants
 
 
-def replicate(
-    array_tree: chex.ArrayTree,
-    sharding: jax.sharding.PositionalSharding,
-) -> chex.ArrayDeviceTree:
-  """Replicates the `array_tree` across all devices specified by `sharding`.
+# def replicate(
+#     array_tree: chex.ArrayTree,
+#     sharding: jax.sharding.PositionalSharding,
+# ) -> chex.ArrayDeviceTree:
+#   """Replicates the `array_tree` across all devices specified by `sharding`.
 
-  In a multi-controller setting, we cannot simply use `jax.device_put` to
-  replicate the `array_tree` since not all devices are addressable from every
-  process.
+#   In a multi-controller setting, we cannot simply use `jax.device_put` to
+#   replicate the `array_tree` since not all devices are addressable from every
+#   process.
 
-  Args:
-    array_tree: The `array_tree` to be replicated across devices.
-    sharding: Describes how the array should be laid out across devices. Here,
-      we just use it to specify that the `array_tree` should be replicated (not
-      sharded).
+#   Args:
+#     array_tree: The `array_tree` to be replicated across devices.
+#     sharding: Describes how the array should be laid out across devices. Here,
+#       we just use it to specify that the `array_tree` should be replicated (not
+#       sharded).
 
-  Returns:
-    The distributed `array_tree`, replicated across all the devices.
-  """
-  return jax.tree.map(
-      lambda array: jax.make_array_from_callback(
-          array.shape, sharding.replicate(), lambda _: array
-      ),
-      array_tree,
-  )
+#   Returns:
+#     The distributed `array_tree`, replicated across all the devices.
+#   """
+#   return jax.tree.map(
+#       lambda array: jax.make_array_from_callback(
+#           array.shape, sharding.replicate(), lambda _: array
+#       ),
+#       array_tree,
+#   )
 
 
 def make_loss_fn(predictor: constants.Predictor) -> Any:
@@ -184,45 +184,45 @@ def get_checkpoint_manager(
   )
 
 
-def restore_checkpoint(
-    checkpoint_manager: ocp.CheckpointManager,
-    step: int,
-    params: hk.Params,
-    params_ema: hk.Params,
-    opt_state: optax.OptState,
-    data_iter: pygrain.PyGrainDatasetIterator,
-    sharding: jax.sharding.PositionalSharding,
-) -> tuple[
-    hk.Params, hk.Params, optax.OptState, pygrain.PyGrainDatasetIterator
-]:
-  """Returns the restored params and optimizer state from a checkpoint."""
+# def restore_checkpoint(
+#     checkpoint_manager: ocp.CheckpointManager,
+#     step: int,
+#     params: hk.Params,
+#     params_ema: hk.Params,
+#     opt_state: optax.OptState,
+#     data_iter: pygrain.PyGrainDatasetIterator,
+#     sharding: jax.sharding.PositionalSharding,
+# ) -> tuple[
+#     hk.Params, hk.Params, optax.OptState, pygrain.PyGrainDatasetIterator
+# ]:
+#   """Returns the restored params and optimizer state from a checkpoint."""
 
-  def make_abstract(array_tree: chex.ArrayTree) -> jax.ShapeDtypeStruct:
-    abstract_array_tree = jax.eval_shape(lambda x: x, array_tree)
-    return jax.tree_util.tree_map(
-        lambda x: jax.ShapeDtypeStruct(
-            shape=x.shape,
-            dtype=x.dtype,
-            sharding=sharding.replicate(),
-        ),
-        abstract_array_tree,
-    )
+#   def make_abstract(array_tree: chex.ArrayTree) -> jax.ShapeDtypeStruct:
+#     abstract_array_tree = jax.eval_shape(lambda x: x, array_tree)
+#     return jax.tree_util.tree_map(
+#         lambda x: jax.ShapeDtypeStruct(
+#             shape=x.shape,
+#             dtype=x.dtype,
+#             sharding=sharding.replicate(),
+#         ),
+#         abstract_array_tree,
+#     )
 
-  restored = checkpoint_manager.restore(
-      step=step,
-      items=dict(
-          params=make_abstract(params),
-          params_ema=make_abstract(params_ema),
-          opt_state=make_abstract(opt_state),
-          data_iter=data_iter,
-      ),
-  )
-  return (
-      restored['params'],
-      restored['params_ema'],
-      restored['opt_state'],
-      restored['data_iter'],
-  )
+#   restored = checkpoint_manager.restore(
+#       step=step,
+#       items=dict(
+#           params=make_abstract(params),
+#           params_ema=make_abstract(params_ema),
+#           opt_state=make_abstract(opt_state),
+#           data_iter=data_iter,
+#       ),
+#   )
+#   return (
+#       restored['params'],
+#       restored['params_ema'],
+#       restored['opt_state'],
+#       restored['data_iter'],
+#   )
 
 
 def load_parameters(
