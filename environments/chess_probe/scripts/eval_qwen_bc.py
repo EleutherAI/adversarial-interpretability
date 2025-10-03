@@ -31,6 +31,7 @@ import numpy as np
 import scipy.stats
 import torch
 from tqdm import tqdm
+import requests
 
 # Ensure vendored searchless_chess package can be imported as `searchless_chess.*`
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -53,6 +54,13 @@ from searchless_chess.src.engines import engine as slc_engine  # noqa: E402
 import chess  # noqa: E402
 
 from libs.run_utils import capture_metadata, start_run, write_config_yaml  # noqa: E402
+import chess.engine  # noqa: E402
+
+# Load probe wrapper
+_MODELS_DIR = _REPO_ROOT / "environments/chess_probe/models"
+if str(_MODELS_DIR) not in sys.path:
+    sys.path.append(str(_MODELS_DIR))
+from probe_model import QwenWithProbe  # noqa: E402
 
 
 @dataclass
@@ -124,23 +132,22 @@ def _slugify(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", text)
 
 
-def build_plain_prompt(fen: str) -> str:
+def build_plain_prompt(fen: str, insert_probe_token: bool = False, probe_token: str = " um") -> str:
     """Plain prompt; no trailing space before the move."""
-    return (
-        "Stockfish is a powerful chess engine. It can be used to recommend the best move for a given chess position.\n"
-        "Input format: a chess position in FEN.\n"
-        "Output format: the best legal move in UCI format only (e.g., e2e4 or e7e8q).\n"
-        "Example:\n"
-        f"{_build_examples_text()}\n"
+    base = (
+        "You are a chess engine. Given a chess position in FEN notation, "
+        "respond with the best legal move in UCI format only.\n\n"
         f"FEN: {fen}\n"
-        "Move (UCI):"
     )
+    return base + (f"{probe_token} Move (UCI):" if insert_probe_token else "Move (UCI):")
 
 
 def build_chat_prompt_text(
     tokenizer: AutoTokenizer,
     fen: str,
     system_prompt: str,
+    insert_probe_token: bool = False,
+    probe_token: str = " um",
 ) -> str:
     """Build chat-template text for Instruct models (e.g., Qwen3-Instruct)."""
     messages = [
@@ -151,7 +158,7 @@ def build_chat_prompt_text(
                 "Given this FEN, respond with the best legal move in raw UCI only.\n"
                 f"{_build_examples_text()}\n"
                 f"FEN: {fen}\n"
-                "Move (UCI):"
+                + (f"{probe_token} Move (UCI):" if insert_probe_token else "Move (UCI):")
             ),
         }
     ]
@@ -191,6 +198,7 @@ def score_candidates(
     device: torch.device,
     pretokenized_moves: Dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     prefer_space: bool = False,
+    teacher_hidden: torch.Tensor | None = None,
 ) -> np.ndarray:
     """Return summed log-probabilities for each candidate completion.
 
@@ -227,7 +235,18 @@ def score_candidates(
             batch[i, :T] = row[0]
             attn[i, :T] = 1
 
-        outputs = model(input_ids=batch, attention_mask=attn)
+        model_kwargs = {"input_ids": batch, "attention_mask": attn}
+        if teacher_hidden is not None:
+            th = teacher_hidden
+            if th.dim() == 1:
+                th = th.unsqueeze(0)
+            # Repeat to match batch size
+            th = th.to(device)
+            th = th.repeat(len(concat_ids), 1)
+            model_kwargs["teacher_hidden_states"] = th
+            # If the model requires tokenizer for layer injection, pass it; harmless otherwise
+            model_kwargs["tokenizer"] = tokenizer
+        outputs = model(**model_kwargs)
         logits = outputs.logits  # [B, T, V]
         logprobs = torch.log_softmax(logits, dim=-1)
 
@@ -271,6 +290,9 @@ def compute_bc_metrics_for_fen(
     use_chat_template: bool,
     system_prompt: str,
     pretokenized_moves: Dict[str, torch.Tensor],
+    teacher_hidden: torch.Tensor | None = None,
+    insert_probe_token: bool = False,
+    probe_token: str = " um",
 ) -> BCPerFenMetrics:
     """Compute BC metrics for one FEN using the labeled move as ground truth."""
     # Engine-ordered legal UCI moves.
@@ -298,9 +320,11 @@ def compute_bc_metrics_for_fen(
             tokenizer=tokenizer,
             fen=fen,
             system_prompt=system_prompt,
+            insert_probe_token=insert_probe_token,
+            probe_token=probe_token,
         )
     else:
-        prompt = build_plain_prompt(fen)
+        prompt = build_plain_prompt(fen, insert_probe_token=insert_probe_token, probe_token=probe_token)
 
     # Score candidates under the language model and renormalize.
     cand_logprobs = score_candidates(
@@ -311,6 +335,7 @@ def compute_bc_metrics_for_fen(
         device,
         pretokenized_moves,
         prefer_space=not use_chat_template,  # base models → leading space
+        teacher_hidden=teacher_hidden,
     )
     probs = np.exp(cand_logprobs - scipy.special.logsumexp(cand_logprobs))
 
@@ -391,6 +416,15 @@ def main() -> None:
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
+    parser.add_argument("--use_probe", action="store_true", help="Evaluate with probe + teacher server")
+    parser.add_argument("--probe_weights_path", type=str, default=None, help="Path to probe weights.pt (required with --use_probe)")
+    parser.add_argument("--teacher_endpoint", type=str, default=None, help="HTTP endpoint for teacher server (required with --use_probe)")
+    parser.add_argument("--teacher_hidden_size", type=int, default=None, help="Teacher hidden size (required with --use_probe)")
+    parser.add_argument("--probe_layer_idx", type=int, default=None, help="Layer index for probe injection; None=concatenate")
+    parser.add_argument("--probe_token", type=str, default=" um", help="Probe token string if using layer injection")
+    parser.add_argument("--eval_against_stockfish", action="store_true", help="Use Stockfish best move as ground truth on next_fen from BC pairs")
+    parser.add_argument("--stockfish_path", type=str, default=str(_VENDOR_ROOT / "searchless_chess/Stockfish/src/stockfish"))
+    parser.add_argument("--stockfish_time_limit", type=float, default=0.1)
     parser.add_argument(
         "--results_dir",
         type=str,
@@ -436,13 +470,37 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-        device_map=None,
-    )
+    # Load base Qwen or QwenWithProbe
+    if args.use_probe:
+        base = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            device_map=None,
+            attn_implementation="eager",
+        )
+        if args.teacher_hidden_size is None or args.teacher_endpoint is None or args.probe_weights_path is None:
+            raise ValueError("--use_probe requires --teacher_hidden_size, --teacher_endpoint, and --probe_weights_path")
+        model = QwenWithProbe(
+            qwen_model=base,
+            teacher_hidden_size=int(args.teacher_hidden_size),
+            freeze_qwen=True,
+            probe_layer_idx=args.probe_layer_idx,
+            probe_token=args.probe_token,
+        )
+        # Load probe weights
+        state = torch.load(Path(args.probe_weights_path), map_location="cpu")
+        model.probe.load_state_dict(state)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            device_map=None,
+            attn_implementation="eager",
+        )
     model.to(device)
     model.eval()
 
@@ -453,10 +511,21 @@ def main() -> None:
         model.to(device)
         model.eval()
 
-    test_data = load_behavioral_cloning_test_data(Path(args.dataset_path))
-    fens = list(test_data.keys())
-    if args.num_eval_data is not None:
-        fens = fens[: args.num_eval_data]
+    # Evaluation data
+    if args.eval_against_stockfish:
+        # Load BC pairs (fen, move) and derive next_fen
+        reader = bagz.BagReader(str(Path(args.dataset_path)))
+        bc_pairs: List[tuple[str, str]] = []
+        for bytes_data in reader:
+            fen, move = slc_constants.CODERS["behavioral_cloning"].decode(bytes_data)
+            bc_pairs.append((fen, move))
+            if args.num_eval_data is not None and len(bc_pairs) >= args.num_eval_data:
+                break
+    else:
+        test_data = load_behavioral_cloning_test_data(Path(args.dataset_path))
+        fens = list(test_data.keys())
+        if args.num_eval_data is not None:
+            fens = fens[: args.num_eval_data]
 
     use_chat_template = _infer_prompt_mode(args.model_name_or_path, tokenizer)
     pretokenized_moves = precompute_candidate_token_ids(tokenizer)
@@ -466,21 +535,76 @@ def main() -> None:
     jsonl_f = open(jsonl_path, "w") if args.save_jsonl else None
 
     try:
-        for fen in tqdm(fens, desc="Evaluating FENs"):
-            labeled_action_id = test_data[fen]
-            m = compute_bc_metrics_for_fen(
-                tokenizer=tokenizer,
-                model=model,
-                fen=fen,
-                labeled_action_id=labeled_action_id,
-                device=device,
-                use_chat_template=use_chat_template,
-                system_prompt=args.system_prompt,
-                pretokenized_moves=pretokenized_moves,
-            )
-            per_fen.append(m)
-            if jsonl_f is not None:
-                jsonl_f.write(json.dumps(asdict(m)) + "\n")
+        if args.eval_against_stockfish:
+            # Optional Stockfish engine
+            engine = chess.engine.SimpleEngine.popen_uci(args.stockfish_path)
+            try:
+                for prev_fen, move in tqdm(bc_pairs, desc="Evaluating next_fen vs Stockfish"):
+                    try:
+                        # Derive next_fen
+                        board = chess.Board(prev_fen)
+                        mv = chess.Move.from_uci(move)
+                        if mv not in board.legal_moves:
+                            continue
+                        board.push(mv)
+                        if board.is_game_over():
+                            continue
+                        next_fen = board.fen()
+                        # Stockfish best on next_fen
+                        result = engine.play(board, chess.engine.Limit(time=args.stockfish_time_limit))
+                        stockfish_best = result.move.uci()
+                        labeled_action_id = slc_utils.MOVE_TO_ACTION.get(stockfish_best)
+                        if labeled_action_id is None:
+                            continue
+                        # Teacher hidden if using probe
+                        teacher_hidden = None
+                        if args.use_probe:
+                            resp = requests.post(
+                                args.teacher_endpoint.rstrip("/") + "/get_hidden_states",
+                                json={"fen": prev_fen, "move": move}, timeout=60,
+                            )
+                            resp.raise_for_status()
+                            hidden_np = np.array(resp.json()["hidden"], dtype=np.float32)
+                            teacher_hidden = torch.from_numpy(hidden_np).to(device).float()
+                        m = compute_bc_metrics_for_fen(
+                            tokenizer=tokenizer,
+                            model=model,
+                            fen=next_fen,
+                            labeled_action_id=int(labeled_action_id),
+                            device=device,
+                            use_chat_template=use_chat_template,
+                            system_prompt=args.system_prompt,
+                            pretokenized_moves=pretokenized_moves,
+                            teacher_hidden=teacher_hidden,
+                            insert_probe_token=(args.use_probe and args.probe_layer_idx is not None),
+                            probe_token=args.probe_token,
+                        )
+                        per_fen.append(m)
+                        if jsonl_f is not None:
+                            jsonl_f.write(json.dumps(asdict(m)) + "\n")
+                    except Exception:
+                        continue
+            finally:
+                engine.close()
+        else:
+            for fen in tqdm(fens, desc="Evaluating FENs"):
+                labeled_action_id = test_data[fen]
+                m = compute_bc_metrics_for_fen(
+                    tokenizer=tokenizer,
+                    model=model,
+                    fen=fen,
+                    labeled_action_id=labeled_action_id,
+                    device=device,
+                    use_chat_template=use_chat_template,
+                    system_prompt=args.system_prompt,
+                    pretokenized_moves=pretokenized_moves,
+                    teacher_hidden=None,
+                    insert_probe_token=(args.use_probe and args.probe_layer_idx is not None),
+                    probe_token=args.probe_token,
+                )
+                per_fen.append(m)
+                if jsonl_f is not None:
+                    jsonl_f.write(json.dumps(asdict(m)) + "\n")
     finally:
         if jsonl_f is not None:
             jsonl_f.close()

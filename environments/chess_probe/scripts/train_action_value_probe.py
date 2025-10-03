@@ -58,6 +58,7 @@ if str(_MODELS_DIR) not in sys.path:
     sys.path.append(str(_MODELS_DIR))
 
 from probe_model import QwenWithProbe  # noqa: E402
+from environments.chess_probe.train_utils import build_prompt, save_probe_weights_zero2  # noqa: E402
 
 
 @dataclass
@@ -72,27 +73,6 @@ class ProbeTrainingSample:
     fen: str
     best_move_uci: str
     teacher_hidden: torch.Tensor
-
-
-def build_prompt(fen: str, insert_probe_token: bool = False, probe_token: str = " um") -> str:
-    """Build prompt for move prediction given a FEN position.
-    
-    Args:
-        fen: Board position in FEN notation
-        insert_probe_token: If True, insert probe token before final prompt
-        probe_token: Token to insert as probe injection point
-    """
-    base_prompt = (
-        "You are a chess engine. Given a chess position in FEN notation, "
-        "respond with the best legal move in UCI format only.\n\n"
-        f"FEN: {fen}\n"
-    )
-    
-    if insert_probe_token:
-        # Insert probe token just before the final prompt
-        return base_prompt + f"{probe_token} Best move (UCI):"
-    else:
-        return base_prompt + "Best move (UCI):"
 
 
 class ActionValueProbeDataset(Dataset):
@@ -368,7 +348,7 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_train_epochs", type=int, default=3)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument(
@@ -380,9 +360,8 @@ def main() -> None:
     parser.add_argument(
         "--probe_layer_idx",
         type=int,
-        default=None,
-        help="Layer index to inject probe (None = concatenate to sequence). "
-             "Use -1 for last layer, -2 for second-to-last, etc.",
+        default=-1,
+        help="Layer index to inject probe (use -1 for last layer, -2 for second-to-last, etc.)",
     )
     parser.add_argument(
         "--probe_token",
@@ -472,7 +451,7 @@ def main() -> None:
     
     collator = ProbeCollator(
         tokenizer=tokenizer,
-        use_layer_injection=(args.probe_layer_idx is not None),
+        use_layer_injection=True,
         probe_token=args.probe_token,
     )
     
@@ -513,33 +492,25 @@ def main() -> None:
         train_dataset=dataset,
         tokenizer=tokenizer,
         data_collator=collator,
-        probe_tokenizer=tokenizer if args.probe_layer_idx is not None else None,
+        probe_tokenizer=tokenizer,
     )
     
     print("Starting training...")
     trainer.train()
 
     # Only main process saves final artifacts
-    is_main_process = False
-    try:
-        from accelerate.utils import DistributedType
-        from accelerate import Accelerator
-        acc = Accelerator()
-        is_main_process = acc.is_main_process
-    except Exception:
-        # Fallback to environment rank checks
-        rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK") or "0"
-        is_main_process = str(rank) == "0"
+    from accelerate.utils import DistributedType
+    from accelerate import Accelerator
+    acc = Accelerator()
+    is_main_process = acc.is_main_process
+
 
     if is_main_process:
         print("Saving final model...")
         trainer.save_model(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
-        # Save probe separately for easy loading
-        torch.save(
-            model.probe.state_dict(),
-            Path(args.output_dir) / "probe_weights.pt",
-        )
+        # Save probe separately with ZeRO-2 gather if available
+        save_probe_weights_zero2(model, Path(args.output_dir) / "probe_weights.pt")
         print(f"Training complete! Artifacts saved to {args.output_dir}")
 
 

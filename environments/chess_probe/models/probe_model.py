@@ -81,27 +81,28 @@ class QwenWithProbe(PreTrainedModel):
         # Get number of layers
         self.num_layers = qwen_model.config.num_hidden_layers
         
-        # Validate and set probe layer
-        if probe_layer_idx is not None:
-            # Handle negative indexing
-            if probe_layer_idx < 0:
-                probe_layer_idx = self.num_layers + probe_layer_idx
-            
-            if probe_layer_idx < 0 or probe_layer_idx >= self.num_layers:
-                raise ValueError(
-                    f"probe_layer_idx={probe_layer_idx} is out of range. "
-                    f"Model has {self.num_layers} layers (indices 0-{self.num_layers-1}). "
-                    f"Use None to concatenate to sequence instead."
-                )
-            
-            print(f"✓ Probe will inject at layer {probe_layer_idx}/{self.num_layers-1} at token '{probe_token}'")
-        else:
-            print(f"✓ Probe will concatenate to sequence (model has {self.num_layers} layers)")
-        
+        # Validate and set probe layer (concatenate mode removed; injection required)
+        if probe_layer_idx is None:
+            probe_layer_idx = -1  # default to last layer
+        # Handle negative indexing
+        if probe_layer_idx < 0:
+            probe_layer_idx = self.num_layers + probe_layer_idx
+        if probe_layer_idx < 0 or probe_layer_idx >= self.num_layers:
+            raise ValueError(
+                f"probe_layer_idx={probe_layer_idx} is out of range. "
+                f"Model has {self.num_layers} layers (indices 0-{self.num_layers-1})."
+            )
+        print(f"✓ Probe will inject at layer {probe_layer_idx}/{self.num_layers-1} at token '{probe_token}'")
         self.probe_layer_idx = probe_layer_idx
         
         # Initialize the trainable probe
         self.probe = LinearProbe(teacher_hidden_size, self.qwen_hidden_size)
+        # Align probe weights dtype to Qwen to avoid bf16/float mismatches
+        try:
+            _model_dtype = next(self.qwen.parameters()).dtype
+            self.probe.to(_model_dtype)
+        except StopIteration:
+            pass
         
         # Freeze Qwen if requested
         if freeze_qwen:
@@ -208,79 +209,48 @@ class QwenWithProbe(PreTrainedModel):
                 **kwargs,
             )
         
-        # Process teacher hidden states through probe
+        # Process teacher hidden states through probe using probe's dtype
+        try:
+            _probe_dtype = next(self.probe.parameters()).dtype
+        except StopIteration:
+            _probe_dtype = teacher_hidden_states.dtype
+        teacher_hidden_states = teacher_hidden_states.to(_probe_dtype)
         probe_output = self.probe(teacher_hidden_states)  # [B, H]
         
-        # If probe_layer_idx is specified, inject at that layer via hook
-        if self.probe_layer_idx is not None:
-            if tokenizer is None:
-                raise ValueError(
-                    "tokenizer must be provided when using probe_layer_idx for layer injection"
-                )
-            
-            # Find probe token positions
-            self._probe_token_position = self._find_probe_token_positions(input_ids, tokenizer)
-            self._probe_output = probe_output
-            
-            # Register hook
-            target_layer = self.qwen.model.layers[self.probe_layer_idx]
-            hook = target_layer.register_forward_hook(self._create_injection_hook())
-            
-            try:
-                output = self.qwen(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                    **kwargs,
-                )
-            finally:
-                hook.remove()
-                self._probe_output = None
-                self._probe_token_position = None
-            
-            return output
-        
-        # Otherwise, concatenate probe to sequence (original behavior)
-        batch_size = input_ids.shape[0]
-        
-        # Get embeddings for the input tokens
-        inputs_embeds = self.qwen.get_input_embeddings()(input_ids)  # [B, T, H]
-        probe_embeds = probe_output.unsqueeze(1)  # [B, 1, H]
-        
-        # Concatenate probe embedding to the end of the sequence
-        inputs_embeds = torch.cat([inputs_embeds, probe_embeds], dim=1)  # [B, T+1, H]
-        
-        # Extend attention mask to include probe token
-        if attention_mask is not None:
-            probe_attention = torch.ones(
-                (batch_size, 1),
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
+        # Always inject at the specified layer via hook
+        if tokenizer is None:
+            raise ValueError(
+                "tokenizer must be provided when using probe injection"
             )
-            attention_mask = torch.cat([attention_mask, probe_attention], dim=1)
-        
-        # Extend labels if provided (probe token doesn't contribute to loss by default)
-        if labels is not None:
-            probe_labels = torch.full(
-                (batch_size, 1),
-                -100,  # Ignore index
-                dtype=labels.dtype,
-                device=labels.device,
+        # Find probe token positions
+        self._probe_token_position = self._find_probe_token_positions(input_ids, tokenizer)
+        # Ensure probe output matches model hidden dtype during injection
+        try:
+            _model_dtype = next(self.qwen.parameters()).dtype
+        except StopIteration:
+            _model_dtype = probe_output.dtype
+        self._probe_output = probe_output.to(_model_dtype)
+        # Register hook
+        target_layer = self.qwen.model.layers[self.probe_layer_idx]
+        hook = target_layer.register_forward_hook(self._create_injection_hook())
+        try:
+            output = self.qwen(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                **kwargs,
             )
-            labels = torch.cat([labels, probe_labels], dim=1)
-        
-        # Forward through Qwen with modified embeddings
-        return self.qwen(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            labels=labels,
-            **kwargs,
-        )
+        finally:
+            hook.remove()
+            self._probe_output = None
+            self._probe_token_position = None
+        return output
     
     def generate(
         self,
         input_ids: torch.Tensor,
         teacher_hidden_states: Optional[torch.Tensor] = None,
+        tokenizer=None,
         **kwargs,
     ):
         """Generate text with optional probe injection.
@@ -296,28 +266,34 @@ class QwenWithProbe(PreTrainedModel):
         if teacher_hidden_states is None:
             return self.qwen.generate(input_ids=input_ids, **kwargs)
         
-        # Process probe
+        # Process probe with dtype alignment
+        try:
+            _probe_dtype = next(self.probe.parameters()).dtype
+        except StopIteration:
+            _probe_dtype = teacher_hidden_states.dtype
+        teacher_hidden_states = teacher_hidden_states.to(_probe_dtype)
         probe_output = self.probe(teacher_hidden_states)
         
-        # If using layer injection, apply hook during generation
-        if self.probe_layer_idx is not None:
-            target_layer = self.qwen.model.layers[self.probe_layer_idx]
-            hook = target_layer.register_forward_hook(
-                self._create_injection_hook(probe_output)
+        # Always use layer injection during generation
+        if tokenizer is None:
+            raise ValueError(
+                "tokenizer must be provided when using probe injection during generate()"
             )
-            
-            try:
-                return self.qwen.generate(input_ids=input_ids, **kwargs)
-            finally:
-                hook.remove()
-        
-        # Otherwise, concatenate to sequence
-        batch_size = input_ids.shape[0]
-        inputs_embeds = self.qwen.get_input_embeddings()(input_ids)
-        probe_embeds = probe_output.unsqueeze(1)
-        inputs_embeds = torch.cat([inputs_embeds, probe_embeds], dim=1)
-        
-        return self.qwen.generate(inputs_embeds=inputs_embeds, **kwargs)
+        # Prepare positions and dtype-aligned probe output for injection
+        self._probe_token_position = self._find_probe_token_positions(input_ids, tokenizer)
+        try:
+            _model_dtype = next(self.qwen.parameters()).dtype
+        except StopIteration:
+            _model_dtype = probe_output.dtype
+        self._probe_output = probe_output.to(_model_dtype)
+        target_layer = self.qwen.model.layers[self.probe_layer_idx]
+        hook = target_layer.register_forward_hook(self._create_injection_hook())
+        try:
+            return self.qwen.generate(input_ids=input_ids, **kwargs)
+        finally:
+            hook.remove()
+            self._probe_output = None
+            self._probe_token_position = None
     
     def get_trainable_parameters(self) -> list:
         """Get only the trainable (probe) parameters."""
