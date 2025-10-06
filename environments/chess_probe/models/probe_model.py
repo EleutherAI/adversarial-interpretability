@@ -118,7 +118,7 @@ class QwenWithProbe(PreTrainedModel):
         self._probe_token_position = None
     
     def _create_injection_hook(self):
-        """Create a forward hook that adds probe output to hidden states at probe token position."""
+        """Create a forward hook that adds probe output to hidden states at probe token positions."""
         def hook(module, input, output):
             # Only inject if we have probe output and know where to inject
             if self._probe_output is None or self._probe_token_position is None:
@@ -133,13 +133,14 @@ class QwenWithProbe(PreTrainedModel):
             # Clone to avoid in-place modification
             modified_hidden = hidden_states.clone()
             
-            # Add probe output only at the probe token position
-            # probe_output: [B, H], probe_token_position: [B] (indices)
+            # Add probe output at all probe token positions
+            # probe_output: [B, H], probe_token_position: list of lists of position indices
             batch_size = hidden_states.shape[0]
             for b in range(batch_size):
-                pos = self._probe_token_position[b]
-                if 0 <= pos < hidden_states.shape[1]:
-                    modified_hidden[b, pos, :] = modified_hidden[b, pos, :] + self._probe_output[b, :]
+                positions = self._probe_token_position[b]
+                for pos in positions:
+                    if 0 <= pos < hidden_states.shape[1]:
+                        modified_hidden[b, pos, :] = modified_hidden[b, pos, :] + self._probe_output[b, :]
             
             if isinstance(output, tuple):
                 return (modified_hidden,) + output[1:]
@@ -152,11 +153,11 @@ class QwenWithProbe(PreTrainedModel):
         self,
         input_ids: torch.Tensor,
         tokenizer,
-    ) -> torch.Tensor:
-        """Find the position of the probe token in each sequence.
+    ) -> list[list[int]]:
+        """Find all positions of the probe token in each sequence.
         
-        Returns tensor of shape [batch_size] with the position index of the probe token.
-        Returns -1 if probe token not found in a sequence.
+        Returns list of lists: for each batch element, a list of position indices
+        where the probe token appears. Empty list if probe token not found.
         """
         # Get the token ID for the probe token
         probe_token_ids = tokenizer.encode(self.probe_token, add_special_tokens=False)
@@ -167,13 +168,12 @@ class QwenWithProbe(PreTrainedModel):
         probe_token_id = probe_token_ids[0]
         
         batch_size, seq_len = input_ids.shape
-        positions = torch.full((batch_size,), -1, dtype=torch.long, device=input_ids.device)
+        positions = []
         
         for b in range(batch_size):
-            # Find last occurrence of probe token (in case it appears multiple times)
+            # Find all occurrences of probe token
             matches = (input_ids[b] == probe_token_id).nonzero(as_tuple=True)[0]
-            if len(matches) > 0:
-                positions[b] = matches[-1]
+            positions.append(matches.tolist())
         
         return positions
     
