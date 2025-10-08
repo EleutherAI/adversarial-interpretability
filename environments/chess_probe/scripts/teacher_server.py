@@ -25,7 +25,7 @@ if str(_VENDOR_ROOT) not in sys.path:
     sys.path.append(str(_VENDOR_ROOT))
 
 
-def create_app(model_size: str, hidden_layer_idx: int | None, device: str):
+def create_app(model_size: str, hidden_layer_idx: str | None, device: str):
     if device == "cpu":
         os.environ["JAX_PLATFORMS"] = "cpu"
     else:
@@ -33,11 +33,25 @@ def create_app(model_size: str, hidden_layer_idx: int | None, device: str):
 
     from environments.chess_probe.models.teacher_wrapper import ActionValueTeacher  # noqa: E402
 
+    # Parse hidden_layer_idx which may be comma-separated list or integer/None
+    parsed_idx = None
+    if hidden_layer_idx is not None:
+        s = str(hidden_layer_idx)
+        if "," in s:
+            try:
+                parsed_idx = [int(x.strip()) for x in s.split(",") if x.strip()]
+            except Exception:
+                parsed_idx = None
+        else:
+            try:
+                parsed_idx = int(s)
+            except Exception:
+                parsed_idx = None
     teacher = ActionValueTeacher(
         model_size=model_size,
         checkpoint_step=-1,
         use_ema=True,
-        hidden_layer_idx=hidden_layer_idx,
+        hidden_layer_idx=parsed_idx,
     )
 
     # No behavioral cloning model; server only proxies action-value teacher
@@ -107,7 +121,8 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model_size", type=str, default="270M", choices=["9M", "136M", "270M"]) 
-    parser.add_argument("--teacher_hidden_layer_idx", type=int, default=None)
+    parser.add_argument("--teacher_hidden_layer_idx", type=str, default=None,
+                        help="Teacher layer index or comma-separated list (e.g., -1 or '2,4,6')")
     parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"]) 
     args = parser.parse_args()
 

@@ -20,7 +20,7 @@ import time
 import glob
 import re
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import chess
 import chess.engine
@@ -243,10 +243,14 @@ class ProbeCollator:
         tokenizer: AutoTokenizer,
         use_layer_injection: bool = False,
         probe_token: str = " um",
+        num_probe_tokens: int = 1,
+        probe_insert_strategy: str = "none",
     ):
         self.tokenizer = tokenizer
         self.use_layer_injection = use_layer_injection
         self.probe_token = probe_token
+        self.num_probe_tokens = max(1, int(num_probe_tokens))
+        self.probe_insert_strategy = probe_insert_strategy
     
     def __call__(self, batch: List[ProbeTrainingSample]) -> Dict[str, torch.Tensor]:
         tokenized_inputs: List[List[int]] = []
@@ -266,6 +270,29 @@ class ProbeCollator:
             prompt_ids = self.tokenizer(
                 prompt_text, add_special_tokens=False, return_tensors=None
             )["input_ids"]
+            # Optionally add more probe tokens inside prompt according to strategy
+            if self.use_layer_injection and self.num_probe_tokens > 1 and self.probe_insert_strategy != "none":
+                probe_ids = self.tokenizer.encode(self.probe_token, add_special_tokens=False)
+                probe_id = probe_ids[0] if len(probe_ids) > 0 else None
+                if probe_id is not None:
+                    k = self.num_probe_tokens - 1  # one already inserted by build_prompt
+                    if self.probe_insert_strategy == "prefix":
+                        prompt_ids = [probe_id] * k + prompt_ids
+                    elif self.probe_insert_strategy == "suffix":
+                        prompt_ids = prompt_ids + [probe_id] * k
+                    elif self.probe_insert_strategy == "interleave":
+                        new_ids: List[int] = []
+                        Lp = len(prompt_ids)
+                        stride = max(1, Lp // (k + 1))
+                        inserts = set((i + 1) * stride for i in range(k))
+                        for i, tid in enumerate(prompt_ids):
+                            new_ids.append(tid)
+                            if (i + 1) in inserts:
+                                new_ids.append(probe_id)
+                        prompt_ids = new_ids
+                    elif self.probe_insert_strategy == "block":
+                        mid = max(0, len(prompt_ids) // 2)
+                        prompt_ids = prompt_ids[:mid] + [probe_id] * k + prompt_ids[mid:]
             target_ids = self.tokenizer(
                 target_text, add_special_tokens=False, return_tensors=None
             )["input_ids"]
@@ -347,7 +374,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--num_train_epochs", type=int, default=3)
+    parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
@@ -363,18 +390,68 @@ def main() -> None:
         default=-1,
         help="Layer index to inject probe (use -1 for last layer, -2 for second-to-last, etc.)",
     )
+    # Removed multi-layer student injection; single --probe_layer_idx only
     parser.add_argument(
         "--probe_token",
         type=str,
         default=" um",
         help="Token to use as probe injection point when using layer injection",
     )
+    parser.add_argument(
+        "--num_probe_tokens",
+        type=int,
+        default=1,
+        help="Number of probe tokens to insert in the prompt (repeated).",
+    )
+    parser.add_argument(
+        "--probe_insert_strategy",
+        type=str,
+        default="none",
+        choices=["none", "prefix", "suffix", "interleave", "block"],
+        help="How to distribute multiple probe tokens within the prompt.",
+    )
+    parser.add_argument(
+        "--probe_type",
+        type=str,
+        choices=["linear", "lowrank"],
+        default="lowrank",
+        help="Use a standard linear probe or low-rank (LoRA-style) probe.",
+    )
+    parser.add_argument(
+        "--lowrank_rank",
+        type=int,
+        default=64,
+        help="Rank r for the low-rank probe (if probe_type=lowrank).",
+    )
+    parser.add_argument(
+        "--probe_use_norm",
+        action="store_true",
+        help="Apply LayerNorm to teacher hidden before projection (lowrank).",
+    )
+    parser.add_argument(
+        "--probe_nonlinearity",
+        type=str,
+        default=None,
+        choices=[None, "relu", "tanh"],
+        help="Optional nonlinearity inside the low-rank bottleneck.",
+    )
+    parser.add_argument(
+        "--per_layer_scale",
+        action="store_true",
+        help="Learn one scalar per injection layer to scale the injected vector.",
+    )
+    # Removed student-conditioned gating flags
+    parser.add_argument(
+        "--static_rank_gate",
+        action="store_true",
+        help="Enable static rank-wise gate per (layer, probe-index).",
+    )
     # sampling_temperature no longer used in BC preprocessing
     parser.add_argument(
         "--teacher_hidden_layer_idx",
-        type=int,
+        type=str,
         default=None,
-        help="Which layer the server extracts from (metadata only).",
+        help="Which teacher layer(s) the server extracts (e.g., -1 or '-3,-2,-1'). Metadata only.",
     )
     parser.add_argument(
         "--teacher_endpoint",
@@ -385,8 +462,18 @@ def main() -> None:
     parser.add_argument(
         "--teacher_hidden_size",
         type=int,
-        required=True,
-        help="Size of teacher hidden state (for probe input).",
+        default=None,
+        help="Size of teacher hidden state (for probe input). If not set, auto-computed from server /meta and --teacher_hidden_layer_idx.",
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to a checkpoint to resume training from. Pass 'auto' to let the trainer "
+            "auto-detect the last checkpoint in the output_dir. If a file like 'global_step*' "
+            "is provided, its parent 'checkpoint-*' directory will be used."
+        ),
     )
     
     args = parser.parse_args()
@@ -407,6 +494,25 @@ def main() -> None:
     # Always use external teacher server
     os.environ["TEACHER_ENDPOINT"] = args.teacher_endpoint
     print(f"Using external teacher at {args.teacher_endpoint}")
+    # Auto-compute teacher_hidden_size if not provided
+    if args.teacher_hidden_size is None:
+        try:
+            meta = requests.get(args.teacher_endpoint.rstrip("/") + "/meta", timeout=10).json()
+            per_layer_dim = int(meta.get("embedding_dim"))
+            # Parse teacher_hidden_layer_idx into a list count
+            idx = args.teacher_hidden_layer_idx
+            if idx is None:
+                num_layers_selected = 1
+            else:
+                s = str(idx)
+                if "," in s:
+                    num_layers_selected = len([x for x in s.split(",") if x.strip()])
+                else:
+                    num_layers_selected = 1
+            args.teacher_hidden_size = per_layer_dim * num_layers_selected
+            print(f"Auto-set teacher_hidden_size={args.teacher_hidden_size} (per_layer_dim={per_layer_dim}, layers_selected={num_layers_selected})")
+        except Exception as e:
+            raise RuntimeError(f"Failed to auto-compute teacher_hidden_size from {args.teacher_endpoint}/meta: {e}")
     
     # Load Qwen tokenizer and model
     print(f"Loading Qwen model ({args.model_name_or_path})...")
@@ -427,6 +533,9 @@ def main() -> None:
         attn_implementation="eager",
     )
     
+    # Resolve probe layers
+    # Single student injection layer is used directly from args.probe_layer_idx
+
     # Wrap Qwen with probe
     print("Creating Qwen + Probe wrapper...")
     model = QwenWithProbe(
@@ -435,6 +544,13 @@ def main() -> None:
         freeze_qwen=True,
         probe_layer_idx=args.probe_layer_idx,
         probe_token=args.probe_token,
+        probe_type=args.probe_type,
+        lowrank_rank=args.lowrank_rank,
+        probe_use_norm=bool(args.probe_use_norm),
+        probe_nonlinearity=args.probe_nonlinearity,
+        per_layer_scale=bool(args.per_layer_scale),
+        static_rank_gate=bool(args.static_rank_gate),
+        rank_gate_slots=args.num_probe_tokens,
     )
     
     print(f"Total parameters: {model.num_total_parameters():,}")
@@ -453,6 +569,8 @@ def main() -> None:
         tokenizer=tokenizer,
         use_layer_injection=True,
         probe_token=args.probe_token,
+        num_probe_tokens=args.num_probe_tokens,
+        probe_insert_strategy=args.probe_insert_strategy,
     )
     
     # Custom Trainer to pass tokenizer to model forward
@@ -496,7 +614,24 @@ def main() -> None:
     )
     
     print("Starting training...")
-    trainer.train()
+    # Support resuming from a specific checkpoint path or auto-detection
+    resume_arg = args.resume_from_checkpoint
+    if resume_arg is None:
+        trainer.train()
+    else:
+        resume_value: bool | str
+        if isinstance(resume_arg, str) and resume_arg.strip().lower() == "auto":
+            resume_value = True  # auto-detect last checkpoint in output_dir
+        else:
+            resume_path = Path(resume_arg)
+            # If a file like .../checkpoint-100/global_step100 is provided, use its parent dir
+            if resume_path.is_file():
+                resume_path = resume_path.parent
+            if not resume_path.exists():
+                raise FileNotFoundError(f"Resume checkpoint path does not exist: {resume_arg}")
+            resume_value = str(resume_path)
+        print(f"Resuming training from checkpoint: {resume_value}")
+        trainer.train(resume_from_checkpoint=resume_value)
 
     # Only main process saves final artifacts
     from accelerate.utils import DistributedType
