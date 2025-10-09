@@ -25,7 +25,7 @@ if str(_VENDOR_ROOT) not in sys.path:
     sys.path.append(str(_VENDOR_ROOT))
 
 
-def create_app(model_size: str, hidden_layer_idx: int | None, device: str):
+def create_app(model_size: str, hidden_layer_idx, device: str):
     if device == "cpu":
         os.environ["JAX_PLATFORMS"] = "cpu"
     else:
@@ -79,6 +79,21 @@ def create_app(model_size: str, hidden_layer_idx: int | None, device: str):
                     tensor = teacher.get_hidden_states(fen, move)
                     self._json(200, {"hidden": tensor.detach().cpu().tolist()})
                     return
+                if path == "/get_hidden_states_at_positions":
+                    fen = data["fen"]
+                    move = data["move"]
+                    positions = data.get("positions", [])
+                    if not isinstance(positions, list):
+                        self._json(400, {"error": "positions must be a list of ints"})
+                        return
+                    tensor = teacher.get_hidden_states_at_positions(fen, move, positions)
+                    self._json(200, {"hidden": tensor.detach().cpu().tolist()})
+                    return
+                if path == "/token_info":
+                    fen = data["fen"]
+                    info = teacher.token_info(fen)
+                    self._json(200, info)
+                    return
                 if path == "/get_hidden_states_batch":
                     fens = data["fens"]
                     moves = data["moves"]
@@ -107,11 +122,27 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model_size", type=str, default="270M", choices=["9M", "136M", "270M"]) 
-    parser.add_argument("--teacher_hidden_layer_idx", type=int, default=None)
+    parser.add_argument("--teacher_hidden_layer_idx", type=str, default=None,
+                        help="Layer index or comma-separated list (e.g., -1 or '2,4,6')")
     parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"]) 
     args = parser.parse_args()
 
-    handler = create_app(args.model_size, args.teacher_hidden_layer_idx, args.device)
+    # Parse multi-layer argument
+    parsed_idx = None
+    if args.teacher_hidden_layer_idx is not None:
+        s = str(args.teacher_hidden_layer_idx)
+        if "," in s:
+            try:
+                parsed_idx = [int(x.strip()) for x in s.split(",") if x.strip()]
+            except Exception:
+                parsed_idx = None
+        else:
+            try:
+                parsed_idx = int(s)
+            except Exception:
+                parsed_idx = None
+
+    handler = create_app(args.model_size, parsed_idx, args.device)
     httpd = ThreadingHTTPServer((args.host, args.port), handler)
     print(f"Teacher server listening on http://{args.host}:{args.port} (model={args.model_size}, device={args.device})")
     try:

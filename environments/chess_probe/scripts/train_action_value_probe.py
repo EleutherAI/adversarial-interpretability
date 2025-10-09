@@ -45,6 +45,9 @@ from transformers import (  # noqa: E402
     TrainingArguments,
 )
 
+from peft import LoraConfig, get_peft_model
+
+
 from searchless_chess.src import bagz  # noqa: E402
 from searchless_chess.src import constants as slc_constants  # noqa: E402
 from searchless_chess.src import utils as slc_utils  # noqa: E402
@@ -90,6 +93,7 @@ class ActionValueProbeDataset(Dataset):
         stockfish_path: str,
         max_records: int | None,
         stockfish_time_limit: float = 0.05,
+        require_teacher: bool = True,
     ):
         """Initialize the dataset.
         
@@ -105,6 +109,7 @@ class ActionValueProbeDataset(Dataset):
         self.stockfish_path = stockfish_path
         self.stockfish_time_limit = stockfish_time_limit
         self.max_records = max_records
+        self.require_teacher = require_teacher
         self._teacher_endpoint = os.environ.get("TEACHER_ENDPOINT")
         # Optional JSONL cache path to coordinate preprocessing across processes
         cache_path = os.environ.get("PREPROCESSED_RECORDS_PATH")
@@ -185,8 +190,8 @@ class ActionValueProbeDataset(Dataset):
     
     def __getitem__(self, idx: int) -> ProbeTrainingSample:
         prev_fen, sampled_move_uci, next_fen = self._records[idx]
-        if not self._teacher_endpoint:
-            raise RuntimeError("TEACHER_ENDPOINT is not set; server is required")
+        if self.require_teacher and not self._teacher_endpoint:
+            raise RuntimeError("TEACHER_ENDPOINT is not set; server is required when require_teacher=True")
         # Compute Stockfish best move on-demand (per worker)
         if self._engine is None:
             try:
@@ -211,13 +216,48 @@ class ActionValueProbeDataset(Dataset):
                 best_move_uci = next(iter(board.legal_moves)).uci()
             except Exception:
                 raise RuntimeError(f"Failed to annotate next_fen with Stockfish: {e}")
-        resp = requests.post(
-            self._teacher_endpoint.rstrip("/") + "/get_hidden_states",
-            json={"fen": prev_fen, "move": sampled_move_uci}, timeout=60,
-        )
-        resp.raise_for_status()
-        hidden_np = np.array(resp.json()["hidden"], dtype=np.float32)
-        teacher_hidden = torch.from_numpy(hidden_np).float()
+        if self.require_teacher and self._teacher_endpoint:
+            # Multi-position teacher vector support: decide positions based on server token_info
+            try:
+                info = requests.post(
+                    self._teacher_endpoint.rstrip("/") + "/token_info",
+                    json={"fen": prev_fen}, timeout=30,
+                ).json()
+                state_len = int(info.get("state_len", 0))
+                action_pos = int(info.get("action_pos", max(0, state_len - 1)))
+            except Exception:
+                state_len = 0
+                action_pos = 0
+            # Determine K from env override (optional) or default to 1; trainer collator may expect K
+            probes_per_layer_env = os.environ.get("PROBES_PER_LAYER")
+            K = int(probes_per_layer_env) if probes_per_layer_env else 1
+            if K <= 1 or state_len <= 0:
+                resp = requests.post(
+                    self._teacher_endpoint.rstrip("/") + "/get_hidden_states",
+                    json={"fen": prev_fen, "move": sampled_move_uci}, timeout=60,
+                )
+                resp.raise_for_status()
+                hidden_np = np.array(resp.json()["hidden"], dtype=np.float32)
+                teacher_hidden = torch.from_numpy(hidden_np).float()
+            else:
+                # Build positions: always include action_pos (last), spread K-1 across [0, state_len-1)
+                positions = [action_pos]
+                remaining = K - 1
+                if remaining > 0:
+                    stride = max(1, state_len // remaining)
+                    for i in range(remaining):
+                        pos = min(i * stride, max(0, state_len - 2))
+                        positions.append(pos)
+                positions = sorted(set(positions))
+                resp = requests.post(
+                    self._teacher_endpoint.rstrip("/") + "/get_hidden_states_at_positions",
+                    json={"fen": prev_fen, "move": sampled_move_uci, "positions": positions}, timeout=60,
+                )
+                resp.raise_for_status()
+                hidden_np = np.array(resp.json()["hidden"], dtype=np.float32)  # [K, H]
+                teacher_hidden = torch.from_numpy(hidden_np).float()
+        else:
+            teacher_hidden = torch.zeros(1, dtype=torch.float32)
         return ProbeTrainingSample(fen=next_fen, best_move_uci=best_move_uci, teacher_hidden=teacher_hidden)
 
     def __del__(self) -> None:
@@ -243,10 +283,14 @@ class ProbeCollator:
         tokenizer: AutoTokenizer,
         use_layer_injection: bool = False,
         probe_token: str = " um",
+        probes_per_layer: int = 1,
+        spread_across_tokens: bool = True,
     ):
         self.tokenizer = tokenizer
         self.use_layer_injection = use_layer_injection
         self.probe_token = probe_token
+        self.probes_per_layer = max(1, int(probes_per_layer))
+        self.spread_across_tokens = bool(spread_across_tokens)
     
     def __call__(self, batch: List[ProbeTrainingSample]) -> Dict[str, torch.Tensor]:
         tokenized_inputs: List[List[int]] = []
@@ -259,6 +303,7 @@ class ProbeCollator:
                 sample.fen,
                 insert_probe_token=self.use_layer_injection,
                 probe_token=self.probe_token,
+                num_probe_tokens=(self.probes_per_layer if self.use_layer_injection else 1),
             )
             target_text = " " + sample.best_move_uci
             
@@ -275,7 +320,13 @@ class ProbeCollator:
             
             tokenized_inputs.append(input_ids)
             tokenized_labels.append(labels)
-            teacher_hiddens.append(sample.teacher_hidden)
+            if self.use_layer_injection:
+                # sample.teacher_hidden may be [H] (single) or stacked [K, H] if dataset fetches by positions.
+                th = sample.teacher_hidden
+                if th.dim() == 1 and self.probes_per_layer > 1:
+                    # Repeat same teacher vector across K positions as fallback
+                    th = th.unsqueeze(0).repeat(self.probes_per_layer, 1)
+                teacher_hiddens.append(th)
         
         # Pad sequences
         pad_id = (
@@ -297,15 +348,24 @@ class ProbeCollator:
             batch_attention[i, :L] = 1
             batch_labels[i, :L] = np.asarray(lab, dtype=np.int64)
         
-        # Stack teacher hidden states
-        teacher_hidden_batch = torch.stack(teacher_hiddens, dim=0)
-        
-        return {
+        batch: Dict[str, torch.Tensor] = {
             "input_ids": torch.tensor(batch_input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(batch_attention, dtype=torch.long),
             "labels": torch.tensor(batch_labels, dtype=torch.long),
-            "teacher_hidden_states": teacher_hidden_batch,
         }
+        if self.use_layer_injection:
+            # If multiple probes, pad to the max K across batch
+            max_k = max(th.shape[0] if th.dim() == 2 else 1 for th in teacher_hiddens)
+            padded: List[torch.Tensor] = []
+            for th in teacher_hiddens:
+                if th.dim() == 1:
+                    th = th.unsqueeze(0)
+                if th.shape[0] < max_k:
+                    th = torch.cat([th, th[-1:].repeat(max_k - th.shape[0], 1)], dim=0)
+                padded.append(th)
+            teacher_hidden_batch = torch.stack(padded, dim=0)  # [B, K, H]
+            batch["teacher_hidden_states"] = teacher_hidden_batch
+        return batch
 
 
 def main() -> None:
@@ -347,7 +407,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--num_train_epochs", type=int, default=3)
+    parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
@@ -369,24 +429,91 @@ def main() -> None:
         default=" um",
         help="Token to use as probe injection point when using layer injection",
     )
+    parser.add_argument(
+        "--probes_per_layer",
+        type=int,
+        default=1,
+        help="Number of distinct probe injections per target layer (K).",
+    )
+    parser.add_argument(
+        "--probe_spread_across_tokens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Spread probe positions across prompt tokens (keeps last token always).",
+    )
+    # Top-K probe configuration
+    parser.add_argument(
+        "--topk_hidden_size",
+        type=int,
+        default=None,
+        help="Hidden size H for TopK pre-projection (defaults to Qwen hidden size).",
+    )
+    parser.add_argument(
+        "--topk_k",
+        type=int,
+        default=None,
+        help="Number of activations to keep in TopK (defaults to max(1, H/8)).",
+    )
     # sampling_temperature no longer used in BC preprocessing
     parser.add_argument(
         "--teacher_hidden_layer_idx",
-        type=int,
+        type=str,
         default=None,
-        help="Which layer the server extracts from (metadata only).",
+        help="Teacher layer index or comma-separated list (e.g., -1 or '2,4,6').",
     )
     parser.add_argument(
         "--teacher_endpoint",
         type=str,
-        required=True,
-        help="HTTP endpoint for external teacher server.",
+        default=None,
+        help="HTTP endpoint for external teacher server (required if --use-probe).",
+    )
+    # Removed --teacher_hidden_size; computed automatically from /meta and --teacher_hidden_layer_idx
+    parser.add_argument(
+        "--use_probe",
+        "--use-probe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the action-value probe (enable with --use-probe; default off).",
+    )
+    # LoRA integration flags
+    parser.add_argument(
+        "--use_lora",
+        action="store_true",
+        help="Enable LoRA adapters on the Qwen backbone (train LoRA + probe).",
     )
     parser.add_argument(
-        "--teacher_hidden_size",
+        "--lora_r",
         type=int,
-        required=True,
-        help="Size of teacher hidden state (for probe input).",
+        default=64,
+        help="LoRA rank r (default: 64)",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=128,
+        help="LoRA alpha scaling (default: 128)",
+    )
+    parser.add_argument(
+        "--lora_dropout",
+        type=float,
+        default=0.05,
+        help="LoRA dropout (default: 0.05)",
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj",
+        help="Comma-separated module names to target for LoRA (qkvo + MLP).",
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Resume training from a checkpoint. Provide a path to a checkpoint "
+            "directory (e.g., .../checkpoint-500) or 'latest' to auto-detect "
+            "the last checkpoint in the output directory."
+        ),
     )
     
     args = parser.parse_args()
@@ -404,9 +531,29 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
-    # Always use external teacher server
-    os.environ["TEACHER_ENDPOINT"] = args.teacher_endpoint
-    print(f"Using external teacher at {args.teacher_endpoint}")
+    # Teacher server is only required if using probe
+    if args.use_probe:
+        if not args.teacher_endpoint:
+            raise RuntimeError("--teacher_endpoint is required when --use-probe is set")
+        os.environ["TEACHER_ENDPOINT"] = args.teacher_endpoint
+        os.environ["PROBES_PER_LAYER"] = str(int(args.probes_per_layer))
+        print(f"Using external teacher at {args.teacher_endpoint}")
+        # Always compute teacher_hidden_size from /meta and --teacher_hidden_layer_idx
+        try:
+            meta = requests.get(args.teacher_endpoint.rstrip("/") + "/meta", timeout=10).json()
+            per_layer_dim = int(meta.get("embedding_dim"))
+            idx = args.teacher_hidden_layer_idx
+            if idx is None:
+                num_layers_selected = 1
+            else:
+                s = str(idx)
+                num_layers_selected = len([x for x in s.split(",") if x.strip()]) if "," in s else 1
+            args.teacher_hidden_size = per_layer_dim * num_layers_selected
+            print(
+                f"Auto-set teacher_hidden_size={args.teacher_hidden_size} (per_layer_dim={per_layer_dim}, layers_selected={num_layers_selected})"
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to compute teacher_hidden_size from {args.teacher_endpoint}/meta: {e}")
     
     # Load Qwen tokenizer and model
     print(f"Loading Qwen model ({args.model_name_or_path})...")
@@ -426,19 +573,50 @@ def main() -> None:
         device_map=None,
         attn_implementation="eager",
     )
+    # Optionally apply LoRA to Qwen
+    if args.use_lora:
+        if LoraConfig is None or get_peft_model is None:
+            raise RuntimeError("peft is not available but --use_lora was set. Please install peft.")
+        target_list = [m.strip() for m in str(args.lora_target_modules).split(",") if m.strip()]
+        lora_cfg = LoraConfig(
+            r=int(args.lora_r),
+            lora_alpha=int(args.lora_alpha),
+            lora_dropout=float(args.lora_dropout),
+            target_modules=target_list,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        qwen = get_peft_model(qwen, lora_cfg)
+        # Ensure only LoRA adapter weights are trainable on the Qwen backbone
+        for name, param in qwen.named_parameters():
+            if "lora_" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
     
-    # Wrap Qwen with probe
-    print("Creating Qwen + Probe wrapper...")
-    model = QwenWithProbe(
-        qwen_model=qwen,
-        teacher_hidden_size=args.teacher_hidden_size,
-        freeze_qwen=True,
-        probe_layer_idx=args.probe_layer_idx,
-        probe_token=args.probe_token,
-    )
+    # Build model (with or without probe)
+    if args.use_probe:
+        print("Creating Qwen + Probe wrapper...")
+        model = QwenWithProbe(
+            qwen_model=qwen,
+            teacher_hidden_size=args.teacher_hidden_size,
+            freeze_qwen=not bool(args.use_lora),
+            probe_layer_idx=args.probe_layer_idx,
+            probe_token=args.probe_token,
+            topk_hidden_size=args.topk_hidden_size,
+            topk_k=args.topk_k,
+        )
+        print(f"Total parameters: {model.num_total_parameters():,}")
+        print(f"Trainable parameters (probe only or probe+LoRA): {model.num_trainable_parameters():,}")
+    else:
+        print("Training without probe (LoRA-only or base).")
+        model = qwen
+        # If not using probe, keep Qwen frozen unless LoRA is enabled (LoRA params already marked trainable)
+        if not args.use_lora:
+            for p in model.parameters():
+                p.requires_grad = False
     
-    print(f"Total parameters: {model.num_total_parameters():,}")
-    print(f"Trainable parameters (probe only): {model.num_trainable_parameters():,}")
+    
     
     # Create dataset
     print("Creating dataset with Stockfish supervision (BC source)...")
@@ -447,12 +625,15 @@ def main() -> None:
         stockfish_path=args.stockfish_path,
         max_records=args.num_train_data,
         stockfish_time_limit=args.stockfish_time_limit,
+        require_teacher=bool(args.use_probe),
     )
     
     collator = ProbeCollator(
         tokenizer=tokenizer,
-        use_layer_injection=True,
+        use_layer_injection=bool(args.use_probe),
         probe_token=args.probe_token,
+        probes_per_layer=int(args.probes_per_layer),
+        spread_across_tokens=bool(args.probe_spread_across_tokens),
     )
     
     # Custom Trainer to pass tokenizer to model forward
@@ -492,11 +673,19 @@ def main() -> None:
         train_dataset=dataset,
         tokenizer=tokenizer,
         data_collator=collator,
-        probe_tokenizer=tokenizer,
+        probe_tokenizer=(tokenizer if args.use_probe else None),
     )
     
     print("Starting training...")
-    trainer.train()
+    # Support resuming from checkpoint if requested
+    resume_arg = None
+    if args.resume_from_checkpoint:
+        val = str(args.resume_from_checkpoint).strip()
+        if val.lower() in ("latest", "last", "true", "yes"):  # auto-detect in output_dir
+            resume_arg = True
+        else:
+            resume_arg = val  # explicit checkpoint path
+    trainer.train(resume_from_checkpoint=resume_arg)
 
     # Only main process saves final artifacts
     from accelerate.utils import DistributedType
@@ -510,7 +699,8 @@ def main() -> None:
         trainer.save_model(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
         # Save probe separately with ZeRO-2 gather if available
-        save_probe_weights_zero2(model, Path(args.output_dir) / "probe_weights.pt")
+        if args.use_probe:
+            save_probe_weights_zero2(model, Path(args.output_dir) / "probe_weights.pt")
         print(f"Training complete! Artifacts saved to {args.output_dir}")
 
 

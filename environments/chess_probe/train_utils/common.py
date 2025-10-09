@@ -9,13 +9,24 @@ import torch.nn.functional as F
 import requests
 
 
-def build_prompt(fen: str, insert_probe_token: bool = False, probe_token: str = " um") -> str:
+def build_prompt(
+    fen: str,
+    insert_probe_token: bool = False,
+    probe_token: str = " um",
+    num_probe_tokens: int = 1,
+) -> str:
     base_prompt = (
         "You are a chess engine. Given a chess position in FEN notation, "
         "respond with the best legal move in UCI format only.\n\n"
         f"FEN: {fen}\n"
     )
-    return base_prompt + (f"{probe_token} Best move (UCI):" if insert_probe_token else "Best move (UCI):")
+    if insert_probe_token:
+        k = max(1, int(num_probe_tokens))
+        # Repeat the probe token exactly K times; probe_token includes a leading space
+        probes_text = probe_token * k
+        return base_prompt + f"{probes_text} Best move (UCI):"
+    else:
+        return base_prompt + "Best move (UCI):"
 
 
 def tokenize_pairs(tokenizer, prompts: List[str], completions: List[str]):

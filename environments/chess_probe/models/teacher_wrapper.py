@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import functools
 from pathlib import Path
-from typing import Callable
+from typing import Callable, List, Union, Optional
 
 import jax
 import jax.numpy as jnp
@@ -31,14 +31,17 @@ from searchless_chess.src import utils as slc_utils  # noqa: E402
 import haiku as hk  # noqa: E402
 
 
-def create_transformer_with_layer_extraction(hidden_layer_idx: int | None = None):
-    """Create a transformer decoder that can extract hidden states from a specific layer.
+def create_transformer_with_layer_extraction(hidden_layer_idx: Union[int, List[int], None] = None):
+    """Create a transformer decoder that can extract hidden states from one or more layers.
     
     Args:
-        hidden_layer_idx: Which layer to extract hidden states from (None = last layer)
+        hidden_layer_idx: Layer index or list of indices to extract hidden states from
+            (None = last layer). Negative indices are supported.
     
     Returns:
-        A function that returns (log_probs, hidden_states_at_layer)
+        A function that returns (log_probs, hidden_states_at_layers)
+        where hidden_states_at_layers has shape [B, T, H] if a single layer is
+        selected, or [B, T, H * L] if multiple layers are selected (concatenated on H).
     """
     def transformer_decoder_with_hidden_states(
         targets: jax.Array,
@@ -55,6 +58,25 @@ def create_transformer_with_layer_extraction(hidden_layer_idx: int | None = None
         
         h = embeddings
         hidden_to_return = None
+        collected: List[jax.Array] = []
+
+        # Normalize selection to a set of positive indices if provided
+        selected: Optional[List[int]]
+        if hidden_layer_idx is None:
+            selected = None
+        elif isinstance(hidden_layer_idx, int):
+            sel = hidden_layer_idx
+            if sel < 0:
+                sel = config.num_layers + sel
+            selected = [sel]
+        else:
+            tmp: List[int] = []
+            for sel in hidden_layer_idx:
+                s = sel
+                if s < 0:
+                    s = config.num_layers + s
+                tmp.append(s)
+            selected = sorted(set(tmp))
         
         for layer_idx in range(config.num_layers):
             attention_input = transformer.layer_norm(h)
@@ -65,16 +87,24 @@ def create_transformer_with_layer_extraction(hidden_layer_idx: int | None = None
             mlp_output = transformer._mlp_block(mlp_input, config)
             h += mlp_output
             
-            # Save hidden state from target layer (after residual)
-            if hidden_layer_idx is not None and layer_idx == hidden_layer_idx:
-                hidden_to_return = h
+            # Save hidden states from selected layers (after residual)
+            if selected is not None and layer_idx in selected:
+                collected.append(h)
         
         if config.apply_post_ln:
             h = transformer.layer_norm(h)
         
         # If no specific layer requested, use final hidden state
-        if hidden_to_return is None:
+        if selected is None:
             hidden_to_return = h
+        else:
+            # Concatenate along hidden dimension if multiple layers selected
+            if len(collected) == 1:
+                hidden_to_return = collected[0]
+            elif len(collected) > 1:
+                hidden_to_return = jnp.concatenate(collected, axis=-1)
+            else:
+                hidden_to_return = h
         
         logits = hk.Linear(config.output_size)(h)
         log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -96,7 +126,7 @@ class ActionValueTeacher:
         model_size: str = "270M",
         checkpoint_step: int = -1,
         use_ema: bool = True,
-        hidden_layer_idx: int | None = None,
+        hidden_layer_idx: Union[int, List[int], None] = None,
     ):
         """Initialize the action value teacher model.
         
@@ -128,26 +158,33 @@ class ActionValueTeacher:
             raise ValueError(f"Unknown model size: {model_size}")
         
         self.num_layers = num_layers
-        self.embedding_dim = embedding_dim
+        self.embedding_dim = embedding_dim  # per-layer embedding size
         
         # Validate and set hidden layer index
         if hidden_layer_idx is not None:
-            # Handle negative indexing
-            if hidden_layer_idx < 0:
-                hidden_layer_idx = num_layers + hidden_layer_idx
-            
-            if hidden_layer_idx < 0 or hidden_layer_idx >= num_layers:
-                raise ValueError(
-                    f"hidden_layer_idx={hidden_layer_idx} is out of range. "
-                    f"Model has {num_layers} layers (indices 0-{num_layers-1}). "
-                    f"Use None to extract from final layer."
-                )
-            
-            print(f"✓ Teacher will extract hidden states from layer {hidden_layer_idx}/{num_layers-1}")
+            if isinstance(hidden_layer_idx, int):
+                idxs = [hidden_layer_idx]
+            else:
+                idxs = list(hidden_layer_idx)
+            resolved: List[int] = []
+            for idx in idxs:
+                s = idx
+                if s < 0:
+                    s = num_layers + s
+                if s < 0 or s >= num_layers:
+                    raise ValueError(
+                        f"hidden_layer_idx={idx} resolves out of range. Model has {num_layers} layers (0-{num_layers-1})."
+                    )
+                resolved.append(s)
+            resolved = sorted(set(resolved))
+            if len(resolved) == 1:
+                print(f"✓ Teacher will extract hidden states from layer {resolved[0]}/{num_layers-1}")
+            else:
+                print(f"✓ Teacher will extract hidden states from layers {resolved} (of 0-{num_layers-1})")
+            self.hidden_layer_idx = resolved
         else:
             print(f"✓ Teacher will extract hidden states from final layer (model has {num_layers} layers)")
-        
-        self.hidden_layer_idx = hidden_layer_idx
+            self.hidden_layer_idx = None
         num_return_buckets = 128
         
         self.config = transformer.TransformerConfig(
@@ -231,6 +268,47 @@ class ActionValueTeacher:
         hidden_torch = torch.from_numpy(hidden_np).float()
         
         return hidden_torch
+
+    def get_hidden_states_at_positions(
+        self,
+        fen: str,
+        move: str,
+        positions: List[int],
+    ) -> torch.Tensor:
+        """Extract hidden states at specific token positions for (fen, move).
+        
+        Returns a tensor of shape [len(positions), embedding_dim * num_selected_layers].
+        """
+        # Build sequence as in get_hidden_states
+        state_tokens = slc_tokenizer.tokenize(fen).astype(np.int32)
+        action_idx = slc_utils.MOVE_TO_ACTION[move]
+        action_token = np.array([action_idx], dtype=np.int32)
+        dummy_return = np.array([0], dtype=np.int32)
+        sequence = np.concatenate([state_tokens, action_token, dummy_return])
+        sequence = np.expand_dims(sequence, axis=0)
+        
+        # Forward
+        _, hidden_states = self.apply_fn(
+            self.params,
+            jrandom.PRNGKey(0),
+            sequence,
+        )
+        # Gather requested positions (clamp within range)
+        T = hidden_states.shape[1]
+        idx = np.clip(np.array(positions, dtype=np.int32), 0, T - 1)
+        gathered = hidden_states[0, idx, :]
+        hidden_np = np.array(gathered)
+        return torch.from_numpy(hidden_np).float()
+
+    def token_info(self, fen: str) -> dict:
+        """Return tokenization info for this FEN for convenience.
+        
+        Includes:
+          - state_len: number of state tokens (FEN tokens)
+          - action_pos: index of the action token position
+        """
+        state_len = int(len(slc_tokenizer.tokenize(fen)))
+        return {"state_len": state_len, "action_pos": state_len}
     
     def get_hidden_states_batch(
         self,

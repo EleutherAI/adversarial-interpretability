@@ -40,6 +40,38 @@ class LinearProbe(nn.Module):
         return self.probe(teacher_hidden)
 
 
+class TopKProbe(nn.Module):
+    """Non-linear Top-K probe: f(x) = W2 TopK(W1 x + b1).
+    
+    TopK retains the largest k activations per vector and zeros the rest.
+    """
+    def __init__(
+        self,
+        teacher_hidden_size: int,
+        qwen_hidden_size: int,
+        hidden_size: int | None = None,
+        topk_k: int | None = None,
+    ):
+        super().__init__()
+        h = int(hidden_size) if hidden_size is not None else int(qwen_hidden_size)
+        self.topk_k = int(topk_k) if topk_k is not None else max(1, h // 8)
+        self.pre = nn.Linear(teacher_hidden_size, h, bias=True)  # W1, b1
+        # By default, no bias for W2 to match W2 TopK(·)
+        self.post = nn.Linear(h, qwen_hidden_size, bias=False)
+        self.hidden_size = h
+    
+    def forward(self, teacher_hidden: torch.Tensor) -> torch.Tensor:
+        # Shape: [..., Tin] -> [..., H]
+        z = self.pre(teacher_hidden)
+        k = min(self.topk_k, self.hidden_size)
+        if k >= self.hidden_size:
+            gated = z
+        else:
+            values, indices = torch.topk(z, k=k, dim=-1)
+            gated = torch.zeros_like(z).scatter_(-1, indices, values)
+        return self.post(gated)
+
+
 class QwenWithProbe(PreTrainedModel):
     """Wrapper model combining frozen Qwen with trainable probe.
     
@@ -58,6 +90,9 @@ class QwenWithProbe(PreTrainedModel):
         freeze_qwen: bool = True,
         probe_layer_idx: Optional[int] = None,
         probe_token: str = " um",
+        # Top-K probe configuration
+        topk_hidden_size: Optional[int] = None,
+        topk_k: Optional[int] = None,
     ):
         """Initialize the QwenWithProbe model.
         
@@ -95,8 +130,13 @@ class QwenWithProbe(PreTrainedModel):
         print(f"✓ Probe will inject at layer {probe_layer_idx}/{self.num_layers-1} at token '{probe_token}'")
         self.probe_layer_idx = probe_layer_idx
         
-        # Initialize the trainable probe
-        self.probe = LinearProbe(teacher_hidden_size, self.qwen_hidden_size)
+        # Initialize the trainable probe (Top-K mapping)
+        self.probe = TopKProbe(
+            teacher_hidden_size=teacher_hidden_size,
+            qwen_hidden_size=self.qwen_hidden_size,
+            hidden_size=topk_hidden_size,
+            topk_k=topk_k,
+        )
         # Align probe weights dtype to Qwen to avoid bf16/float mismatches
         try:
             _model_dtype = next(self.qwen.parameters()).dtype
@@ -116,6 +156,40 @@ class QwenWithProbe(PreTrainedModel):
         # Storage for injection state during forward pass
         self._probe_output = None
         self._probe_token_position = None
+        
+    def _get_transformer_layers(self):
+        """Resolve the list of transformer layers robustly, including PEFT-wrapped models.
+        
+        Tries common container paths in order and unwraps PEFT if present.
+        """
+        base = self.qwen
+        # Unwrap PEFT wrapper if available
+        get_base = getattr(base, "get_base_model", None)
+        if callable(get_base):
+            try:
+                base = get_base()
+            except Exception:
+                pass
+        candidates = [
+            ("model", "layers"),
+            ("transformer", "layers"),
+            ("model", "transformer", "layers"),
+            ("model", "blocks"),
+            ("decoder", "layers"),
+            ("gpt", "layers"),
+            ("backbone", "layers"),
+        ]
+        for path in candidates:
+            obj = base
+            ok = True
+            for name in path:
+                obj = getattr(obj, name, None)
+                if obj is None:
+                    ok = False
+                    break
+            if ok and hasattr(obj, "__len__"):
+                return obj
+        raise AttributeError("Could not locate transformer layers on Qwen model (PEFT or HF layout changed)")
     
     def _create_injection_hook(self):
         """Create a forward hook that adds probe output to hidden states at probe token positions."""
@@ -133,14 +207,33 @@ class QwenWithProbe(PreTrainedModel):
             # Clone to avoid in-place modification
             modified_hidden = hidden_states.clone()
             
-            # Add probe output at all probe token positions
-            # probe_output: [B, H], probe_token_position: list of lists of position indices
+            # Add probe output at probe token positions
+            # Shapes:
+            #  - self._probe_output: [B, H] (single probe) OR [B, K, H] (multi-probe)
+            #  - self._probe_token_position: list[list[int]] with positions per batch element
             batch_size = hidden_states.shape[0]
-            for b in range(batch_size):
-                positions = self._probe_token_position[b]
-                for pos in positions:
-                    if 0 <= pos < hidden_states.shape[1]:
-                        modified_hidden[b, pos, :] = modified_hidden[b, pos, :] + self._probe_output[b, :]
+            if self._probe_output.dim() == 3:
+                # Multi-probe case: index the i-th vector into the i-th position
+                B, K, H = self._probe_output.shape
+                if B != batch_size:
+                    raise ValueError(f"Probe output batch {B} does not match hidden batch {batch_size}")
+                for b in range(batch_size):
+                    positions = self._probe_token_position[b]
+                    if len(positions) != K:
+                        raise ValueError(
+                            f"Expected {K} probe positions for batch {b}, got {len(positions)}. "
+                            "Ensure prompts contain exactly K probe tokens and alignment is correct."
+                        )
+                    for i, pos in enumerate(positions):
+                        if 0 <= pos < hidden_states.shape[1]:
+                            modified_hidden[b, pos, :] = modified_hidden[b, pos, :] + self._probe_output[b, i, :]
+            else:
+                # Single-probe case: add same vector to all found positions (backward compatible)
+                for b in range(batch_size):
+                    positions = self._probe_token_position[b]
+                    for pos in positions:
+                        if 0 <= pos < hidden_states.shape[1]:
+                            modified_hidden[b, pos, :] = modified_hidden[b, pos, :] + self._probe_output[b, :]
             
             if isinstance(output, tuple):
                 return (modified_hidden,) + output[1:]
@@ -153,11 +246,13 @@ class QwenWithProbe(PreTrainedModel):
         self,
         input_ids: torch.Tensor,
         tokenizer,
+        probes_per_layer: int = 1,
+        spread_across_tokens: bool = False,
     ) -> list[list[int]]:
-        """Find all positions of the probe token in each sequence.
+        """Find probe token positions. Supports multiple probes per layer.
         
-        Returns list of lists: for each batch element, a list of position indices
-        where the probe token appears. Empty list if probe token not found.
+        If spread_across_tokens is True, we take the last token and then pick
+        remaining positions roughly evenly across the prompt tokens.
         """
         # Get the token ID for the probe token
         probe_token_ids = tokenizer.encode(self.probe_token, add_special_tokens=False)
@@ -171,9 +266,26 @@ class QwenWithProbe(PreTrainedModel):
         positions = []
         
         for b in range(batch_size):
-            # Find all occurrences of probe token
             matches = (input_ids[b] == probe_token_id).nonzero(as_tuple=True)[0]
-            positions.append(matches.tolist())
+            pos_list = matches.tolist()
+            if probes_per_layer <= 1 or not spread_across_tokens:
+                positions.append(pos_list)
+                continue
+            # Choose last occurrence and spread remaining across the rest
+            if len(pos_list) == 0:
+                positions.append([])
+                continue
+            chosen = [pos_list[-1]]
+            remaining = probes_per_layer - 1
+            if remaining > 0:
+                # spread across earlier positions or whole sequence if only one occurrence
+                candidate_pool = pos_list[:-1] if len(pos_list) > 1 else list(range(seq_len - 1))
+                if len(candidate_pool) > 0:
+                    stride = max(1, len(candidate_pool) // remaining)
+                    for i in range(remaining):
+                        idx = min(i * stride, len(candidate_pool) - 1)
+                        chosen.append(candidate_pool[idx])
+            positions.append(sorted(set(chosen)))
         
         return positions
     
@@ -215,23 +327,34 @@ class QwenWithProbe(PreTrainedModel):
         except StopIteration:
             _probe_dtype = teacher_hidden_states.dtype
         teacher_hidden_states = teacher_hidden_states.to(_probe_dtype)
-        probe_output = self.probe(teacher_hidden_states)  # [B, H]
+        if teacher_hidden_states.dim() == 3:
+            # [B, K, Tdim] -> map each K separately and keep K
+            B, K, Tin = teacher_hidden_states.shape
+            probe_output = self.probe(teacher_hidden_states.view(B * K, Tin)).view(B, K, -1)  # [B, K, H]
+        else:
+            probe_output = self.probe(teacher_hidden_states)  # [B, H]
         
         # Always inject at the specified layer via hook
         if tokenizer is None:
             raise ValueError(
                 "tokenizer must be provided when using probe injection"
             )
-        # Find probe token positions
-        self._probe_token_position = self._find_probe_token_positions(input_ids, tokenizer)
+        # Find probe token positions; if multiple K, spread across tokens
+        if isinstance(teacher_hidden_states, torch.Tensor) and teacher_hidden_states.dim() == 3:
+            probes_per_layer = teacher_hidden_states.shape[1]
+            self._probe_token_position = self._find_probe_token_positions(
+                input_ids, tokenizer, probes_per_layer=probes_per_layer, spread_across_tokens=True
+            )
+        else:
+            self._probe_token_position = self._find_probe_token_positions(input_ids, tokenizer)
         # Ensure probe output matches model hidden dtype during injection
         try:
             _model_dtype = next(self.qwen.parameters()).dtype
         except StopIteration:
             _model_dtype = probe_output.dtype
         self._probe_output = probe_output.to(_model_dtype)
-        # Register hook
-        target_layer = self.qwen.model.layers[self.probe_layer_idx]
+        # Register hook on resolved transformer layer
+        target_layer = self._get_transformer_layers()[self.probe_layer_idx]
         hook = target_layer.register_forward_hook(self._create_injection_hook())
         try:
             output = self.qwen(
@@ -286,7 +409,7 @@ class QwenWithProbe(PreTrainedModel):
         except StopIteration:
             _model_dtype = probe_output.dtype
         self._probe_output = probe_output.to(_model_dtype)
-        target_layer = self.qwen.model.layers[self.probe_layer_idx]
+        target_layer = self._get_transformer_layers()[self.probe_layer_idx]
         hook = target_layer.register_forward_hook(self._create_injection_hook())
         try:
             return self.qwen.generate(input_ids=input_ids, **kwargs)
