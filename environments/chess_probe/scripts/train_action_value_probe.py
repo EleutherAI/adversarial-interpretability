@@ -19,8 +19,11 @@ import json
 import time
 import glob
 import re
+import threading
 from pathlib import Path
 from typing import Dict, List
+import subprocess
+import yaml
 
 import chess
 import chess.engine
@@ -61,7 +64,37 @@ if str(_MODELS_DIR) not in sys.path:
     sys.path.append(str(_MODELS_DIR))
 
 from probe_model import QwenWithProbe  # noqa: E402
-from environments.chess_probe.train_utils import build_prompt, save_probe_weights_zero2  # noqa: E402
+from environments.chess_probe.train_utils import save_probe_weights_zero2  # noqa: E402
+
+
+def format_fen_board_spaced(fen: str) -> str:
+    """Format FEN with space-separated board only; leave metadata compact.
+    
+    This compromise strategy ensures all board characters tokenize to single tokens
+    (letters, pieces, '.', '/') while avoiding the 2-token issue with digits in metadata.
+    
+    Example:
+        Input:  "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        Output: "r n b q k b n r / p p p p p p p p / . . . . . . . . / ... w KQkq - 0 1"
+    """
+    parts = fen.split(' ')
+    board = parts[0]
+    
+    # Expand digit compression (8 -> . . . . . . . .)
+    expanded_board = []
+    for char in board:
+        if char.isdigit():
+            expanded_board.extend(['.'] * int(char))
+        else:
+            expanded_board.append(char)
+    
+    # Space-separate board only
+    board_spaced = ' '.join(expanded_board)
+    
+    # Keep metadata compact (no spacing)
+    metadata = ' '.join(parts[1:])  # side, castling, en passant, halfmove, fullmove
+    
+    return board_spaced + ' ' + metadata
 
 
 @dataclass
@@ -87,13 +120,16 @@ class ActionValueProbeDataset(Dataset):
     (prev_fen, move) at item access time via the teacher server.
     """
     
+    _request_semaphore = threading.Semaphore(5)
+    
     def __init__(
         self,
         dataset_path: Path,
         stockfish_path: str,
         max_records: int | None,
-        stockfish_time_limit: float = 0.05,
+        stockfish_time_limit: float = 0.4,
         require_teacher: bool = True,
+        teacher_move_source: str = "previous",
     ):
         """Initialize the dataset.
         
@@ -102,18 +138,23 @@ class ActionValueProbeDataset(Dataset):
             stockfish_path: Path to Stockfish binary
             max_records: Maximum number of samples to generate (None for all)
             stockfish_time_limit: Time limit per Stockfish analysis (seconds)
-            sampling_temperature: Temperature for sampling moves from win probs.
-                Lower = sharper (more likely to pick high win prob moves).
-                Default: 0.5 (fairly sharp, focuses on strong moves)
+            teacher_move_source: Whether to query the teacher on the 'previous' move (BC data)
+                or the 'current' move (Stockfish target for the next position).
         """
         self.stockfish_path = stockfish_path
         self.stockfish_time_limit = stockfish_time_limit
         self.max_records = max_records
         self.require_teacher = require_teacher
+        mode = str(teacher_move_source).lower()
+        if mode not in {"previous", "current"}:
+            raise ValueError(f"teacher_move_source must be 'previous' or 'current' (got {teacher_move_source!r})")
+        self.teacher_move_source = mode
         self._teacher_endpoint = os.environ.get("TEACHER_ENDPOINT")
         # Optional JSONL cache path to coordinate preprocessing across processes
         cache_path = os.environ.get("PREPROCESSED_RECORDS_PATH")
         self._records_path = Path(cache_path) if cache_path else None
+        # Per-worker HTTP session for connection reuse
+        self._session: requests.Session | None = None
         
         # Resolve sharded bagz pattern if single file not found
         resolved_path = dataset_path
@@ -188,6 +229,28 @@ class ActionValueProbeDataset(Dataset):
     def __len__(self) -> int:
         return min(len(self._records), self.max_records if self.max_records is not None else len(self._records))
     
+    def _fetch_with_retry(self, endpoint: str, payload: dict, max_retries: int = 3, timeout: float = 120.0) -> dict:
+        """Fetch from teacher server with retry logic and exponential backoff."""
+        if self._session is None:
+            self._session = requests.Session()
+        
+        for attempt in range(max_retries):
+            try:
+                with self._request_semaphore:
+                    resp = self._session.post(
+                        self._teacher_endpoint.rstrip("/") + endpoint,
+                        json=payload,
+                        timeout=timeout,
+                    )
+                    resp.raise_for_status()
+                    return resp.json()
+            except (requests.Timeout, requests.ConnectionError, requests.RequestException) as e:
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"Failed after {max_retries} attempts on {endpoint}: {e}")
+                wait = (2 ** attempt) * 0.5
+                time.sleep(wait)
+        raise RuntimeError("Unreachable")
+    
     def __getitem__(self, idx: int) -> ProbeTrainingSample:
         prev_fen, sampled_move_uci, next_fen = self._records[idx]
         if self.require_teacher and not self._teacher_endpoint:
@@ -216,13 +279,15 @@ class ActionValueProbeDataset(Dataset):
                 best_move_uci = next(iter(board.legal_moves)).uci()
             except Exception:
                 raise RuntimeError(f"Failed to annotate next_fen with Stockfish: {e}")
+        fen_for_teacher = prev_fen
+        move_for_teacher = sampled_move_uci
+        if self.teacher_move_source == "current":
+            fen_for_teacher = next_fen
+            move_for_teacher = best_move_uci
         if self.require_teacher and self._teacher_endpoint:
             # Multi-position teacher vector support: decide positions based on server token_info
             try:
-                info = requests.post(
-                    self._teacher_endpoint.rstrip("/") + "/token_info",
-                    json={"fen": prev_fen}, timeout=30,
-                ).json()
+                info = self._fetch_with_retry("/token_info", {"fen": fen_for_teacher}, timeout=30.0)
                 state_len = int(info.get("state_len", 0))
                 action_pos = int(info.get("action_pos", max(0, state_len - 1)))
             except Exception:
@@ -232,12 +297,12 @@ class ActionValueProbeDataset(Dataset):
             probes_per_layer_env = os.environ.get("PROBES_PER_LAYER")
             K = int(probes_per_layer_env) if probes_per_layer_env else 1
             if K <= 1 or state_len <= 0:
-                resp = requests.post(
-                    self._teacher_endpoint.rstrip("/") + "/get_hidden_states",
-                    json={"fen": prev_fen, "move": sampled_move_uci}, timeout=60,
+                result = self._fetch_with_retry(
+                    "/get_hidden_states",
+                    {"fen": fen_for_teacher, "move": move_for_teacher},
+                    timeout=120.0,
                 )
-                resp.raise_for_status()
-                hidden_np = np.array(resp.json()["hidden"], dtype=np.float32)
+                hidden_np = np.array(result["hidden"], dtype=np.float32)
                 teacher_hidden = torch.from_numpy(hidden_np).float()
             else:
                 # Build positions: always include action_pos (last), spread K-1 across [0, state_len-1)
@@ -249,12 +314,12 @@ class ActionValueProbeDataset(Dataset):
                         pos = min(i * stride, max(0, state_len - 2))
                         positions.append(pos)
                 positions = sorted(set(positions))
-                resp = requests.post(
-                    self._teacher_endpoint.rstrip("/") + "/get_hidden_states_at_positions",
-                    json={"fen": prev_fen, "move": sampled_move_uci, "positions": positions}, timeout=60,
+                result = self._fetch_with_retry(
+                    "/get_hidden_states_at_positions",
+                    {"fen": fen_for_teacher, "move": move_for_teacher, "positions": positions},
+                    timeout=120.0,
                 )
-                resp.raise_for_status()
-                hidden_np = np.array(resp.json()["hidden"], dtype=np.float32)  # [K, H]
+                hidden_np = np.array(result["hidden"], dtype=np.float32)  # [K, H]
                 teacher_hidden = torch.from_numpy(hidden_np).float()
         else:
             teacher_hidden = torch.zeros(1, dtype=torch.float32)
@@ -264,6 +329,11 @@ class ActionValueProbeDataset(Dataset):
         try:
             if self._engine is not None:
                 self._engine.close()
+        except Exception:
+            pass
+        try:
+            if self._session is not None:
+                self._session.close()
         except Exception:
             pass
 
@@ -285,27 +355,66 @@ class ProbeCollator:
         probe_token: str = " um",
         probes_per_layer: int = 1,
         spread_across_tokens: bool = True,
+        use_chat_template: bool = False,
+        system_prompt: str | None = None,
     ):
         self.tokenizer = tokenizer
         self.use_layer_injection = use_layer_injection
         self.probe_token = probe_token
         self.probes_per_layer = max(1, int(probes_per_layer))
         self.spread_across_tokens = bool(spread_across_tokens)
+        self.use_chat_template = bool(use_chat_template)
+        self.system_prompt = system_prompt or (
+            "Stockfish is a powerful chess engine. It can be used to recommend the best move for a given chess position.\n"
+            "Input format: a chess position in FEN.\n"
+            "Output format: the best legal move in UCI format only (e.g., e2e4 or e7e8q).\n"
+        )
     
     def __call__(self, batch: List[ProbeTrainingSample]) -> Dict[str, torch.Tensor]:
         tokenized_inputs: List[List[int]] = []
         tokenized_labels: List[List[int]] = []
         teacher_hiddens: List[torch.Tensor] = []
         
+        def _build_plain_prompt(fen: str) -> str:
+            # Format FEN with space-separated board for better tokenization
+            fen_formatted = format_fen_board_spaced(fen)
+            base = (
+                "You are a chess engine. Given a chess position in FEN notation, "
+                "respond with the best legal move in UCI format only.\n\n"
+                f"FEN: {fen_formatted}\n"
+            )
+            if self.use_layer_injection:
+                inject = self.probe_token * self.probes_per_layer
+                return base + f"{inject} Move (UCI):"
+            return base + "Move (UCI):"
+
+        def _build_chat_prompt(fen: str) -> str:
+            # Format FEN with space-separated board for better tokenization
+            fen_formatted = format_fen_board_spaced(fen)
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        "Given this FEN, respond with the best legal move in raw UCI only.\n"
+                        f"FEN: {fen_formatted}\n"
+                        + (f"{self.probe_token * self.probes_per_layer} Move (UCI):" if self.use_layer_injection else "Move (UCI):")
+                    ),
+                },
+            ]
+            return self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+
         for sample in batch:
             # Build prompt (insert probe token if using layer injection)
-            prompt_text = build_prompt(
-                sample.fen,
-                insert_probe_token=self.use_layer_injection,
-                probe_token=self.probe_token,
-                num_probe_tokens=(self.probes_per_layer if self.use_layer_injection else 1),
-            )
-            target_text = " " + sample.best_move_uci
+            if self.use_chat_template:
+                prompt_text = _build_chat_prompt(sample.fen)
+            else:
+                # Prefer local builder to guarantee multi-probe token insertion semantics
+                prompt_text = _build_plain_prompt(sample.fen)
+            # Target formatting: leading space for base models; none for chat templates
+            target_text = ("" if self.use_chat_template else " ") + sample.best_move_uci
             
             # Tokenize
             prompt_ids = self.tokenizer(
@@ -406,7 +515,7 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=6)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -414,8 +523,15 @@ def main() -> None:
     parser.add_argument(
         "--stockfish_time_limit",
         type=float,
-        default=0.1,
+        default=0.4,
         help="Time limit for Stockfish analysis per position (seconds)",
+    )
+    parser.add_argument(
+        "--teacher_move_source",
+        type=str,
+        default="previous",
+        choices=["previous", "current"],
+        help="Which move to use when querying teacher hidden states ('previous' uses the BC move; 'current' uses the Stockfish target).",
     )
     parser.add_argument(
         "--probe_layer_idx",
@@ -510,23 +626,96 @@ def main() -> None:
         type=str,
         default=None,
         help=(
-            "Resume training from a checkpoint. Provide a path to a checkpoint "
-            "directory (e.g., .../checkpoint-500) or 'latest' to auto-detect "
-            "the last checkpoint in the output directory."
+            "Resume training from a checkpoint. Provide: 'latest' to auto-detect in the current run's output dir; "
+            "a checkpoint dir (e.g., .../checkpoint-500); or a run directory containing 'artifacts/', in which case "
+            "the latest checkpoint under 'artifacts/' is used."
         ),
+    )
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help="Name of the run for logging and saving artifacts.",
+    )
+    parser.add_argument(
+        "--system_prompt",
+        type=str,
+        default=(
+            "Stockfish is a powerful chess engine. It can be used to recommend the best move for a given chess position.\n"
+            "Input format: a chess position in FEN.\n"
+            "Output format: the best legal move in UCI format only (e.g., e2e4 or e7e8q).\n"
+        ),
+        help="System message used when chat-template prompting is selected (instruct models).",
     )
     
     args = parser.parse_args()
     
-    # Setup run directory
-    run_dir = start_run(
-        base_dir=Path(args.output_dir).parent, run_prefix="av_probe_train"
-    )
-    training_output_dir = Path(run_dir) / "artifacts"
-    training_output_dir.mkdir(parents=True, exist_ok=True)
-    args.output_dir = str(training_output_dir)
-    write_config_yaml(run_dir, f"{sys.executable} " + " ".join(sys.argv), vars(args))
-    capture_metadata(run_dir)
+    def _slugify(text: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(text))
+
+    def _infer_prompt_mode(model_name_or_path: str, tokenizer: AutoTokenizer) -> bool:
+        lower = str(model_name_or_path).lower()
+        if "base" in lower:
+            return False
+        has_chat = getattr(tokenizer, "chat_template", None) is not None
+        return bool(has_chat)
+
+    # If resuming from a provided run directory, hydrate missing args from its config and reuse its run dir
+    resume_run_dir: Path | None = None
+    if args.resume_from_checkpoint:
+        val = str(args.resume_from_checkpoint).strip()
+        cand = Path(val)
+        if cand.exists() and cand.is_dir():
+            # Detect run dir from various inputs: checkpoint dir, artifacts dir, or run dir itself
+            if (cand / "metadata.json").exists() or (cand / "config.yaml").exists():
+                resume_run_dir = cand
+            elif cand.name.startswith("checkpoint-"):
+                parent = cand.parent
+                resume_run_dir = parent.parent if parent.name == "artifacts" else parent
+            elif (cand / "artifacts").is_dir():
+                resume_run_dir = cand
+            elif cand.parent.name == "artifacts":
+                resume_run_dir = cand.parent.parent
+            # Merge args from config.yaml if present, but keep any explicit CLI overrides
+            if resume_run_dir and (resume_run_dir / "config.yaml").exists():
+                try:
+                    with open(resume_run_dir / "config.yaml", "r", encoding="utf-8") as fh:
+                        cfg = yaml.safe_load(fh) or {}
+                except Exception:
+                    cfg = {}
+                # Config may store args flattened at top-level or under 'args'
+                cfg_args = dict(cfg)
+                if "args" in cfg_args and isinstance(cfg_args["args"], dict):
+                    cfg_args = cfg_args["args"]
+                # Apply only to options that remain at their parser defaults
+                for action in parser._actions:
+                    dest = getattr(action, "dest", None)
+                    if not dest or not hasattr(args, dest):
+                        continue
+                    if dest in ("help",):
+                        continue
+                    if dest in cfg_args:
+                        current_val = getattr(args, dest)
+                        default_val = parser.get_default(dest)
+                        if current_val == default_val:
+                            setattr(args, dest, cfg_args[dest])
+
+    # Setup run directory (reuse when resuming from an existing run dir)
+    if resume_run_dir is not None:
+        run_dir = resume_run_dir
+        training_output_dir = Path(run_dir) / "artifacts"
+        training_output_dir.mkdir(parents=True, exist_ok=True)
+        args.output_dir = str(training_output_dir)
+        print(f"Resuming into existing run directory: {run_dir}")
+    else:
+        run_dir = start_run(
+            base_dir=Path(args.output_dir).parent, run_prefix="av_probe_train"
+        )
+        training_output_dir = Path(run_dir) / "artifacts"
+        training_output_dir.mkdir(parents=True, exist_ok=True)
+        args.output_dir = str(training_output_dir)
+        write_config_yaml(run_dir, f"{sys.executable} " + " ".join(sys.argv), vars(args))
+        capture_metadata(run_dir)
     
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -626,14 +815,20 @@ def main() -> None:
         max_records=args.num_train_data,
         stockfish_time_limit=args.stockfish_time_limit,
         require_teacher=bool(args.use_probe),
+        teacher_move_source=args.teacher_move_source,
     )
     
+    # Infer prompting style (chat-template for instruct models)
+    use_chat_template = _infer_prompt_mode(args.model_name_or_path, tokenizer)
+
     collator = ProbeCollator(
         tokenizer=tokenizer,
         use_layer_injection=bool(args.use_probe),
         probe_token=args.probe_token,
         probes_per_layer=int(args.probes_per_layer),
         spread_across_tokens=bool(args.probe_spread_across_tokens),
+        use_chat_template=use_chat_template,
+        system_prompt=args.system_prompt,
     )
     
     # Custom Trainer to pass tokenizer to model forward
@@ -648,6 +843,20 @@ def main() -> None:
                 inputs["tokenizer"] = self.probe_tokenizer
             return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
     
+    # Auto-generate run name if not provided
+    if not getattr(args, "run_name", None):
+        if bool(args.use_probe):
+            probe_type = "topk" if (args.topk_hidden_size is not None or args.topk_k is not None) else "linear"
+        else:
+            probe_type = "none"
+        teacher_layers = str(args.teacher_hidden_layer_idx) if args.teacher_hidden_layer_idx is not None else "None"
+        args.run_name = (
+            f"{'probe' if args.use_probe else 'no-probe'}-"
+            f"{probe_type}-K{int(args.probes_per_layer)}-layers{teacher_layers}-"
+            f"mv{args.teacher_move_source}-"
+            f"{_slugify(args.model_name_or_path)}-{'lora' if args.use_lora else 'nolora'}"
+        )
+
     # Training arguments
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -665,6 +874,8 @@ def main() -> None:
         bf16=True,
         dataloader_pin_memory=False,
         report_to="wandb",
+        run_name=str(args.run_name) if getattr(args, "run_name", None) else None,
+        dataloader_num_workers=20,
     )
     
     trainer = ProbeTrainer(
@@ -678,13 +889,73 @@ def main() -> None:
     
     print("Starting training...")
     # Support resuming from checkpoint if requested
+    def _current_commit(repo_root: Path) -> str | None:
+        try:
+            out = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(repo_root))
+            return out.decode().strip()
+        except Exception:
+            return None
+
+    def _select_latest_checkpoint_dir(base: Path) -> Path | None:
+        if base.name.startswith("checkpoint-") and base.is_dir():
+            return base
+        # Prefer artifacts subdir if present
+        search_root = base / "artifacts" if (base / "artifacts").is_dir() else base
+        if not search_root.is_dir():
+            return None
+        candidates = [p for p in search_root.iterdir() if p.is_dir() and p.name.startswith("checkpoint-")]
+        if not candidates:
+            return None
+        def step_num(p: Path) -> int:
+            try:
+                return int(p.name.split("-")[-1])
+            except Exception:
+                return -1
+        candidates.sort(key=step_num)
+        return candidates[-1]
+
+    def _warn_commit_mismatch(possible_run_dir: Path) -> None:
+        meta_path = possible_run_dir / "metadata.json"
+        if not meta_path.exists():
+            return
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+            prev_commit = (meta.get("git") or {}).get("commit_full")
+        except Exception:
+            prev_commit = None
+        cur_commit = _current_commit(_REPO_ROOT)
+        if prev_commit and cur_commit and prev_commit != cur_commit:
+            print(
+                f"WARNING: Commit mismatch between run ({prev_commit[:12]}) and current repo ({cur_commit[:12]}). Proceeding to resume anyway."
+            )
+
     resume_arg = None
     if args.resume_from_checkpoint:
         val = str(args.resume_from_checkpoint).strip()
         if val.lower() in ("latest", "last", "true", "yes"):  # auto-detect in output_dir
             resume_arg = True
         else:
-            resume_arg = val  # explicit checkpoint path
+            cand = Path(val)
+            if cand.exists() and cand.is_dir():
+                # If a run directory is provided, select latest checkpoint under artifacts/
+                ckpt = _select_latest_checkpoint_dir(cand)
+                if ckpt is None and cand.name == "artifacts":
+                    ckpt = _select_latest_checkpoint_dir(cand)
+                if ckpt is None and (cand / "artifacts").is_dir():
+                    ckpt = _select_latest_checkpoint_dir(cand / "artifacts")
+                if ckpt is not None:
+                    # Warn on commit mismatch if we can locate the run dir
+                    run_dir_candidate = cand if (cand / "metadata.json").exists() else cand.parent if (cand.parent / "metadata.json").exists() else None
+                    if run_dir_candidate is not None:
+                        _warn_commit_mismatch(run_dir_candidate)
+                    print(f"Resuming from latest checkpoint: {ckpt}")
+                    resume_arg = str(ckpt)
+                else:
+                    # Fallback: pass the directory as provided
+                    resume_arg = val
+            else:
+                resume_arg = val  # explicit path
     trainer.train(resume_from_checkpoint=resume_arg)
 
     # Only main process saves final artifacts

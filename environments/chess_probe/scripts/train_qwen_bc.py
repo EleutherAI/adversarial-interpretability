@@ -55,6 +55,36 @@ from searchless_chess.src import constants as slc_constants  # noqa: E402
 from libs.run_utils import capture_metadata, start_run, write_config_yaml  # noqa: E402
 
 
+def format_fen_board_spaced(fen: str) -> str:
+    """Format FEN with space-separated board only; leave metadata compact.
+    
+    This compromise strategy ensures all board characters tokenize to single tokens
+    (letters, pieces, '.', '/') while avoiding the 2-token issue with digits in metadata.
+    
+    Example:
+        Input:  "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        Output: "r n b q k b n r / p p p p p p p p / . . . . . . . . / ... w KQkq - 0 1"
+    """
+    parts = fen.split(' ')
+    board = parts[0]
+    
+    # Expand digit compression (8 -> . . . . . . . .)
+    expanded_board = []
+    for char in board:
+        if char.isdigit():
+            expanded_board.extend(['.'] * int(char))
+        else:
+            expanded_board.append(char)
+    
+    # Space-separate board only
+    board_spaced = ' '.join(expanded_board)
+    
+    # Keep metadata compact (no spacing)
+    metadata = ' '.join(parts[1:])  # side, castling, en passant, halfmove, fullmove
+    
+    return board_spaced + ' ' + metadata
+
+
 # Few-shot examples to improve instruction following for base models.
 FEW_SHOT_EXAMPLES: List[Tuple[str, str, str]] = [
     (
@@ -76,9 +106,11 @@ FEW_SHOT_EXAMPLES: List[Tuple[str, str, str]] = [
 
 
 def _build_examples_text() -> str:
+    """Build few-shot examples with formatted FENs for better tokenization."""
     lines = ["Examples:"]
     for fen, move, why in FEW_SHOT_EXAMPLES:
-        lines.append(f"FEN: {fen}")
+        fen_formatted = format_fen_board_spaced(fen)
+        lines.append(f"FEN: {fen_formatted}")
         lines.append(f"Move (UCI): {move}")
         lines.append(f"Why: {why}")
     return "\n".join(lines)
@@ -86,13 +118,15 @@ def _build_examples_text() -> str:
 
 def build_plain_prompt(fen: str) -> str:
     """Plain prompt; no trailing space before the move."""
+    # Format FEN with space-separated board for better tokenization
+    fen_formatted = format_fen_board_spaced(fen)
     return (
         "Stockfish is a powerful chess engine. It can be used to recommend the best move for a given chess position.\n"
         "Input format: a chess position in FEN.\n"
         "Output format: the best legal move in UCI format only (e.g., e2e4 or e7e8q).\n"
         "Example:\n"
         f"{_build_examples_text()}\n"
-        f"FEN: {fen}\n"
+        f"FEN: {fen_formatted}\n"
         "Move (UCI):"
     )
 
@@ -107,6 +141,8 @@ def build_chat_prompt_text(
     Returns the text with a generation prompt (assistant role start) but without
     the assistant content.
     """
+    # Format FEN with space-separated board for better tokenization
+    fen_formatted = format_fen_board_spaced(fen)
     messages = [
         {"role": "system", "content": system_prompt},
         {
@@ -114,7 +150,7 @@ def build_chat_prompt_text(
             "content": (
                 "Given this FEN, respond with the best legal move in raw UCI only.\n"
                 f"{_build_examples_text()}\n"
-                f"FEN: {fen}\n"
+                f"FEN: {fen_formatted}\n"
                 "Move (UCI):"
             ),
         },

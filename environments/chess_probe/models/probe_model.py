@@ -323,10 +323,14 @@ class QwenWithProbe(PreTrainedModel):
         
         # Process teacher hidden states through probe using probe's dtype
         try:
-            _probe_dtype = next(self.probe.parameters()).dtype
+            _first_param = next(self.qwen.parameters())
+            model_device = _first_param.device
+            _model_dtype = _first_param.dtype
         except StopIteration:
-            _probe_dtype = teacher_hidden_states.dtype
-        teacher_hidden_states = teacher_hidden_states.to(_probe_dtype)
+            model_device = teacher_hidden_states.device
+            _model_dtype = teacher_hidden_states.dtype
+        # Move inputs to the model's device/dtype; do NOT move module after optimizer init
+        teacher_hidden_states = teacher_hidden_states.to(device=model_device, dtype=_model_dtype)
         if teacher_hidden_states.dim() == 3:
             # [B, K, Tdim] -> map each K separately and keep K
             B, K, Tin = teacher_hidden_states.shape
@@ -429,3 +433,87 @@ class QwenWithProbe(PreTrainedModel):
     def num_total_parameters(self) -> int:
         """Count all parameters (Qwen + probe)."""
         return sum(p.numel() for p in self.parameters())
+
+    # Backward-compatible state dict loading to handle older checkpoints that used LinearProbe
+    def load_state_dict(self, state_dict, strict: bool = True):  # type: ignore[override]
+        try:
+            return super().load_state_dict(state_dict, strict=strict)
+        except RuntimeError:
+            # Backward compatibility path for linear probe checkpoints with various key layouts
+            # Supported legacy layouts (any of):
+            #  1) "probe.probe.weight" / "probe.probe.bias"
+            #  2) "probe.weight" / "probe.bias"
+            #  3) "weight" / "bias" (raw nn.Linear state_dict)
+            weight_key_candidates = [
+                "probe.probe.weight",
+                "probe.weight",
+                "weight",
+            ]
+            bias_key_candidates = [
+                "probe.probe.bias",
+                "probe.bias",
+                "bias",
+            ]
+            old_weight = None
+            old_bias = None
+            found_w_key = None
+            found_b_key = None
+            for k in weight_key_candidates:
+                if k in state_dict:
+                    old_weight = state_dict[k]
+                    found_w_key = k
+                    break
+            for k in bias_key_candidates:
+                if k in state_dict:
+                    old_bias = state_dict[k]
+                    found_b_key = k
+                    break
+            if old_weight is None:
+                # Not a recognized legacy layout; re-raise original error
+                raise
+
+            # Shapes per PyTorch Linear: weight [out_features, in_features]
+            qwen_out, teacher_in = old_weight.shape
+
+            # Ensure our probe is TopKProbe; if hidden size doesn't match teacher_in, rebuild probe accordingly
+            try:
+                current_hidden = int(getattr(self.probe, "hidden_size"))  # type: ignore[attr-defined]
+            except Exception:
+                current_hidden = None
+
+            if current_hidden is None or current_hidden != teacher_in:
+                # Rebuild probe with identity-compatible hidden size
+                new_probe = TopKProbe(
+                    teacher_hidden_size=teacher_in,
+                    qwen_hidden_size=qwen_out,
+                    hidden_size=teacher_in,
+                    topk_k=teacher_in,
+                )
+                # Match dtype/device to qwen
+                try:
+                    _model_dtype = next(self.qwen.parameters()).dtype
+                    new_probe.to(_model_dtype)
+                except StopIteration:
+                    pass
+                self.probe = new_probe
+
+            # Prepare a remapped state dict: identity pre, carry over old weight as post
+            remapped = dict(state_dict)
+            # Remove old keys to avoid unexpected key errors
+            if found_w_key is not None:
+                remapped.pop(found_w_key, None)
+            if found_b_key is not None:
+                remapped.pop(found_b_key, None)
+
+            # Identity for pre: weight [H, Tin] == I, bias zeros (avoid shape mismatch with old bias)
+            H = getattr(self.probe, "hidden_size")  # type: ignore[attr-defined]
+            I = torch.eye(H, dtype=old_weight.dtype)
+            remapped["probe.pre.weight"] = I
+            remapped["probe.pre.bias"] = torch.zeros(H, dtype=old_weight.dtype)
+
+            # Post is the original linear mapping
+            remapped["probe.post.weight"] = old_weight
+            # No bias for post in TopKProbe by design
+
+            # Finally, try loading again with the remapped keys; allow non-strict to tolerate any extra scheduler keys
+            return super().load_state_dict(remapped, strict=False)

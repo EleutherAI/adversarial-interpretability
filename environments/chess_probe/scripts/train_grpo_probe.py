@@ -68,7 +68,7 @@ def main() -> None:
     parser.add_argument("--teacher_hidden_size", type=int, required=True)
     parser.add_argument("--dataset_path", type=str, default=str(_VENDOR_ROOT / "searchless_chess/data/train/behavioral_cloning_data.bag"))
     parser.add_argument("--stockfish_path", type=str, default=str(_VENDOR_ROOT / "searchless_chess/Stockfish/src/stockfish"))
-    parser.add_argument("--stockfish_time_limit", type=float, default=0.05)
+    parser.add_argument("--stockfish_time_limit", type=float, default=0.4)
     parser.add_argument("--probe_layer_idx", type=int, default=-1)
     parser.add_argument("--probe_token", type=str, default=" um")
     parser.add_argument("--num_train_data", type=int, default=500)
