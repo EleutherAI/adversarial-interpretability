@@ -36,7 +36,7 @@ from searchless_chess.src import constants as slc_constants  # noqa: E402
 from searchless_chess.src import tokenizer as slc_tokenizer  # noqa: E402
 from searchless_chess.src import utils as slc_utils  # noqa: E402
 
-from libs.run_utils import capture_metadata, start_run, write_config_yaml  # noqa: E402
+from gamescope.libs.run_utils import capture_metadata, start_run, write_config_yaml  # noqa: E402
 
 
 @dataclass

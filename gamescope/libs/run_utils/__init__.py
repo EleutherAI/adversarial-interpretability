@@ -9,8 +9,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
+import getpass
 
 import yaml
+from contextlib import contextmanager
 
 
 DEFAULT_SUBDIRS: List[str] = [
@@ -192,6 +194,155 @@ def capture_metadata(run_dir: Path | str, extra: Optional[Dict[str, Any]] = None
 
     with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=2)
+    # Append a lightweight record to the shared runs index for discoverability
+    try:
+        _append_runs_index_event(run_path, event="start", timestamp=metadata.get("timestamp_utc"), status="running")
+    except Exception:
+        pass
     return meta_path
+
+
+def _derive_results_root(run_path: Path) -> Path:
+    # Expecting results/<env>/<experiment>/<run>
+    return run_path.parents[3] if len(run_path.parents) >= 4 else run_path.parents[-1]
+
+
+def _append_runs_index_event(run_path: Path, event: str, timestamp: Optional[str], status: Optional[str], exit_reason: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> None:
+    results_root = _derive_results_root(run_path)
+    index_dir = Path(results_root) / "index"
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    argv0 = (sys.argv[1] if (len(sys.argv) > 1 and sys.argv[0].endswith("python")) else sys.argv[0])
+    script_name = Path(argv0).stem
+    record: Dict[str, Any] = {
+        "event": event,
+        "timestamp_utc": timestamp or _now_utc_str(),
+        "run_dir": str(run_path),
+        "run_basename": run_path.name,
+        "experiment_name": run_path.parent.name,
+        "env_name": run_path.parent.parent.name if len(run_path.parents) >= 2 else None,
+        "results_root": str(results_root),
+        "hostname": socket.gethostname(),
+        "user": getpass.getuser(),
+        "pid": os.getpid(),
+        "git_commit_short": _git_metadata().get("commit_short"),
+        "script_name": script_name,
+        "status": status,
+        "exit_reason": exit_reason,
+    }
+    if extra:
+        record.update(_coerce(extra))
+
+    index_path = index_dir / "runs_index.jsonl"
+    line = json.dumps(record, ensure_ascii=False)
+    fd = os.open(str(index_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY)
+    try:
+        os.write(fd, (line + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def mark_status(run_dir: Path | str, status: str, exit_reason: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Path:
+    """Write a status.json in the run dir and append a terminal event to the runs index.
+
+    status: "success" | "failed" | custom
+    exit_reason: e.g., "exception", "system_exit", "normal"
+    """
+    run_path = Path(run_dir)
+    status_path = run_path / "status.json"
+    payload: Dict[str, Any] = {
+        "timestamp_utc": _now_utc_str(),
+        "status": status,
+    }
+    if exit_reason:
+        payload["exit_reason"] = exit_reason
+    if extra:
+        payload.update(_coerce(extra))
+    with open(status_path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    try:
+        _append_runs_index_event(run_path, event="end", timestamp=payload["timestamp_utc"], status=status, exit_reason=exit_reason, extra=extra)
+    except Exception:
+        pass
+    return status_path
+
+
+@contextmanager
+def run_context(base_dir: Path | str, run_prefix: Optional[str] = None, config_args: Any = None, config_filename: str = "config.yaml", create_subdirs: bool = True, subdirs: Optional[List[str]] = None):
+    """Context manager that sets up a run directory and marks status on exit.
+
+    Usage:
+        with run_context(base_dir=results_dir, run_prefix="qwen_bc_eval", config_args=vars(args)) as run_dir:
+            ...
+    """
+    run_dir = start_run(base_dir=base_dir, run_prefix=run_prefix, create_subdirs=create_subdirs, subdirs=subdirs)
+    write_config_yaml(run_dir, f"{sys.executable} " + " ".join(sys.argv), config_args or {}, filename=config_filename)
+    capture_metadata(run_dir)
+    try:
+        yield run_dir
+    except SystemExit as e:
+        mark_status(run_dir, status="failed" if int(getattr(e, "code", 1) or 1) != 0 else "success", exit_reason="system_exit")
+        raise
+    except Exception:
+        mark_status(run_dir, status="failed", exit_reason="exception")
+        raise
+    else:
+        mark_status(run_dir, status="success", exit_reason="normal")
+
+
+def _resolve_run_dir_from_path(path: Path) -> Optional[Path]:
+    cur = path.resolve()
+    if cur.is_file():
+        cur = cur.parent
+    for ancestor in [cur] + list(cur.parents):
+        if (ancestor / "metadata.json").exists():
+            return ancestor
+    return None
+
+
+def mark_artifact_used(artifact_path: Path | str, consumer_run_dir: Optional[Path | str] = None, reason: Optional[str] = None) -> None:
+    """Record that an artifact produced by a run was used elsewhere.
+
+    Writes a line to <producer_run_dir>/artifacts/USED_BY.jsonl and appends an
+    'artifact_used' event to the runs index for the producer run.
+    """
+    art_path = Path(artifact_path)
+    producer_run = _resolve_run_dir_from_path(art_path)
+    if producer_run is None:
+        return
+    artifacts_dir = producer_run / "artifacts"
+    try:
+        rel = str(art_path.resolve().relative_to(artifacts_dir)) if art_path.resolve().is_relative_to(artifacts_dir) else art_path.name
+    except Exception:
+        rel = art_path.name
+
+    used_by_path = artifacts_dir / "USED_BY.jsonl"
+    record: Dict[str, Any] = {
+        "when": _now_utc_str(),
+        "artifact_relpath": rel,
+        "consumer_run_dir": str(consumer_run_dir) if consumer_run_dir else os.environ.get("RUN_DIR"),
+        "host": socket.gethostname(),
+        "user": getpass.getuser(),
+    }
+    if reason:
+        record["reason"] = reason
+
+    used_by_path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False)
+    fd = os.open(str(used_by_path), os.O_CREAT | os.O_APPEND | os.O_WRONLY)
+    try:
+        os.write(fd, (line + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+
+    try:
+        _append_runs_index_event(producer_run, event="artifact_used", timestamp=None, status=None, exit_reason=None, extra={
+            "artifact_relpath": rel,
+            "consumer_run_dir": record.get("consumer_run_dir"),
+            "reason": reason,
+        })
+    except Exception:
+        pass
 
 

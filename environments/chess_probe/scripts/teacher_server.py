@@ -31,7 +31,7 @@ def create_app(model_size: str, hidden_layer_idx, device: str):
     else:
         os.environ.pop("JAX_PLATFORMS", None)
 
-    from environments.chess_probe.models.teacher_wrapper import ActionValueTeacher  # noqa: E402
+    from gamescope.environments.chess_probe.models.teacher_wrapper import ActionValueTeacher  # noqa: E402
 
     teacher = ActionValueTeacher(
         model_size=model_size,

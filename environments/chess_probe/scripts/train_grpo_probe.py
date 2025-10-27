@@ -41,7 +41,7 @@ if str(_MODELS_DIR) not in sys.path:
     sys.path.append(str(_MODELS_DIR))
 
 from probe_model import QwenWithProbe  # noqa: E402
-from environments.chess_probe.train_utils import (
+from gamescope.environments.chess_probe.train_utils import (
     build_prompt,
     tokenize_pairs,
     seq_logprobs_from_logits,
@@ -54,11 +54,11 @@ from environments.chess_probe.train_utils import (
     save_probe_weights_zero2,
 )
 
-from libs.run_utils import capture_metadata, start_run, write_config_yaml  # noqa: E402
+from gamescope.libs.run_utils import capture_metadata, start_run, write_config_yaml  # noqa: E402
 import requests  # noqa: E402
 
 
-from environments.chess_probe.train_utils import tokenize_pairs  # re-import for type hints
+from gamescope.environments.chess_probe.train_utils import tokenize_pairs  # re-import for type hints
 
 
 def main() -> None:
@@ -216,7 +216,7 @@ def main() -> None:
     if accelerator.is_main_process:
         out_dir.mkdir(parents=True, exist_ok=True)
         tokenizer.save_pretrained(out_dir)
-        from environments.chess_probe.train_utils import save_probe_weights_zero2
+        from gamescope.environments.chess_probe.train_utils import save_probe_weights_zero2
         save_probe_weights_zero2(model, out_dir / "probe_weights.pt")
         print(f"Training complete. Artifacts in {out_dir}")
 

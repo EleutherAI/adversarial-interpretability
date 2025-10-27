@@ -55,7 +55,7 @@ from searchless_chess.src import bagz  # noqa: E402
 from searchless_chess.src import constants as slc_constants  # noqa: E402
 from searchless_chess.src import utils as slc_utils  # noqa: E402
 
-from libs.run_utils import capture_metadata, start_run, write_config_yaml  # noqa: E402
+from gamescope.libs.run_utils import capture_metadata, start_run, write_config_yaml  # noqa: E402
 import requests  # noqa: E402
 
 import sys
@@ -64,7 +64,7 @@ if str(_MODELS_DIR) not in sys.path:
     sys.path.append(str(_MODELS_DIR))
 
 from probe_model import QwenWithProbe  # noqa: E402
-from environments.chess_probe.train_utils import save_probe_weights_zero2  # noqa: E402
+from gamescope.environments.chess_probe.train_utils import save_probe_weights_zero2  # noqa: E402
 
 
 def format_fen_board_spaced(fen: str) -> str:

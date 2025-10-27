@@ -1,10 +1,10 @@
 [project]
-name = "modelscope"
+name = "gamescope"
 version = "0.0.0"
 description = "Research repo"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license-files = ["LICENSE"]
 dependencies = [
   "numpy",
   "scipy",
@@ -40,5 +40,8 @@ searchless-chess = { workspace = true, editable = true }
 members = [
     "environments/chess_probe/vendor/searchless_chess",
 ]
+
+[tool.setuptools]
+packages = ["gamescope"]
 
 

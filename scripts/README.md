@@ -22,3 +22,36 @@ CLI conventions
   - Save checkpoints under `artifacts/` and plots under `plots/`
 - On completion:
   - Write a final `summary.json` (best metrics, artifact paths)
+
+## find_run
+
+List and locate experiment runs using the append-only filesystem index at `results/index/runs_index.jsonl`.
+
+Usage:
+
+```bash
+uv run python scripts/find_run.py
+```
+
+Default (no args):
+- Shows non-junk runs (heuristic: has artifacts or metrics) grouped by script and ordered by newest first.
+- Displays per-run duration (start→end) and usage count (number of artifact_used events).
+
+Options (coming soon):
+- `--results-root PATH` — path to the results directory (index assumed at `<results-root>/index`).
+- `--contains STR` — filter runs whose run directory name contains `STR` (case-insensitive).
+- `--env STR` — filter runs whose environment name contains `STR` (case-insensitive).
+- Additional filters (experiment, commit, config, status) will be added alongside `open_log.py`.
+
+## reindex_runs
+
+Backfill the runs index for existing runs so they show up in `find_run`.
+
+Usage:
+
+```bash
+uv run python scripts/reindex_runs.py --results-root results
+```
+
+Flags:
+- `--dry-run` — print records instead of writing to the index.

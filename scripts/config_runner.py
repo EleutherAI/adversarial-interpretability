@@ -9,7 +9,7 @@ from typing import Any, Dict
 
 import yaml
 
-from libs.run_utils import capture_metadata, ensure_run_dir, start_run, write_config_yaml
+from gamescope.libs.run_utils import capture_metadata, ensure_run_dir, start_run, write_config_yaml
 
 
 def main() -> None:

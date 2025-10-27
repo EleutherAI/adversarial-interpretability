@@ -51,6 +51,25 @@ Results and experiment tracking
   - During training/eval: append metrics to `metrics.jsonl`, write plots and artifacts under the run directory
 - Remote trackers: optionally mirror metrics to W&B or MLflow, but the filesystem record above is the source of truth for reproducibility.
 
+Index and discovery
+- An append-only index is maintained at `results/index/runs_index.jsonl` for fast discovery.
+- New runs are auto-indexed:
+  - On entry via `gamescope.libs.run_utils.capture_metadata()` or the `run_context(...)` context manager (writes a `start` event)
+  - On exit via `gamescope.libs.run_utils.mark_status()` (writes an `end` event with exit reason)
+- Artifact usage can be logged to surface interesting runs:
+  - Call `gamescope.libs.run_utils.mark_artifact_used(path_to_artifact, reason="...")`
+  - This writes `<run_dir>/artifacts/USED_BY.jsonl` and an `artifact_used` event in the index
+
+CLI helpers
+- List runs (non-junk by default, grouped by script, newest first; includes duration and usage counts):
+```bash
+uv run python scripts/find_run.py --results-root results
+```
+- Backfill the index for existing runs:
+```bash
+uv run python scripts/reindex_runs.py --results-root results
+```
+
 ### Config runner
 
 Run any experiment from a YAML file; a fresh run directory is created and the full config is recorded.

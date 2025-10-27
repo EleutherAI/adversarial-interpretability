@@ -54,7 +54,7 @@ from searchless_chess.src.engines import engine as slc_engine  # noqa: E402
 
 import chess  # noqa: E402
 
-from libs.run_utils import capture_metadata, start_run, write_config_yaml  # noqa: E402
+from gamescope.libs.run_utils import capture_metadata, start_run, write_config_yaml  # noqa: E402
 import chess.engine  # noqa: E402
 
 # Load probe wrapper
