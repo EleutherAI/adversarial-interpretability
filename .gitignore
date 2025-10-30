@@ -109,8 +109,10 @@ figures/
 .venv/
 results/
 
-environments/chess_probe/vendor/searchless_chess/data/
-environments/chess_probe/vendor/searchless_chess/BayesElo/
-
+gamescope/environments/chess_probe/vendor/searchless_chess/data/
+gamescope/environments/chess_probe/vendor/searchless_chess/BayesElo/
+gamescope/environments/chess_probe/vendor/searchless_chess/checkpoints/
 
 AGENTS.md
+
+gamestate_renders/*

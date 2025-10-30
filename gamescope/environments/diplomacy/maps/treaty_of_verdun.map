@@ -1,0 +1,93 @@
+VICTORY 9
+ADRIATIC SEA = ADR Adriatic+Sea
+ANGLOSAXONS = ANG Anglosaxons
+AQUITAINE = AQU Aquitaine
+ATLANTIC OCEAN = ATL Atlantic+Ocean
+AVARS = AVA Avars
+BALTIC SEA = BAL Baltic+Sea
+BAVARIA = BAV Bavaria
+BRETONS = BRE Bretons
+BURGUNDY = BUR Burgundy
+CROATS = CRO Croats
+DANES = DAN Danes
+ENGLISH CHANNEL = ENG English+Channel
+FLANDERS = FLA Flanders
+FRANCONIA = FRA Franconia
+FRIESLAND = FRI Friesland
+GASCONY = GAS Gascony
+LOMBARDY = LOM Lombardy
+LORRAINE = LOR Lorraine
+MEDITERRANEAN SEA = MED Mediterranean+Sea
+MOORS = MOO Moors
+NEUSTRIA = NEU Neustria
+NEUSTRIA (NORTH COAST) = NEU/NC Neustria+(North+Coast)
+NEUSTRIA (SOUTH COAST) = NEU/SC Neustria+(South+Coast)
+PAPAL STATES = PAP Papal+States
+PROVENCE = PRO Provence
+SAXONY = SAX Saxony
+SAXONY (EAST COAST) = SAX/EC Saxony+(East+Coast)
+SAXONY (WEST COAST) = SAX/WC Saxony+(West+Coast)
+SEPTIMANIA = SEP Septimania
+SERBS = SER Serbs
+SLAVS = SLA Slavs
+SWABIA = SWA Swabia
+THURINGIA = THU Thuringia
+TRANSJURANIA = TRA Transjurania
+TUSCANY = TUS Tuscany
+TUSCANY (EAST COAST) = TUS/EC Tuscany+(East+Coast)
+TUSCANY (WEST COAST) = TUS/WC Tuscany+(West+Coast)
+WESTPHALIA = WES Westphalia
+COAST NEU/NC ABUTS Atl Bre Eng Fla
+COAST NEU/SC ABUTS Aqu Atl Bre
+COAST neu ABUTS aqu ATL bre bur ENG fla
+COAST SAX/EC ABUTS Bal Dan Sla
+COAST SAX/WC ABUTS Bal Dan Eng Fri
+COAST sax ABUTS BAL dan ENG fri sla thu wes
+COAST TUS/EC ABUTS Adr Cro Pap
+COAST TUS/WC ABUTS Lom Med Pap
+COAST tus ABUTS ADR bav cro lom MED pap swa
+WATER ADR ABUTS Cro Pap Ser Tus/ec
+COAST ANG ABUTS Atl Bal Eng
+COAST AQU ABUTS Atl bur GAS Neu/sc pro sep neu
+WATER ATL ABUTS Ang Aqu Bre Eng Gas Moo Neu/nc Neu/sc
+LAND AVA ABUTS bav cro ser sla
+WATER BAL ABUTS Ang Dan Eng Sax/ec Sax/wc Sla
+LAND BAV ABUTS ava cro fra sla swa thu tus
+COAST BRE ABUTS Atl Neu/nc Neu/sc neu
+LAND BUR ABUTS aqu fla lor pro tra neu
+COAST CRO ABUTS Adr ava bav SER Tus/ec tus
+COAST DAN ABUTS Bal Sax/ec Sax/wc sax
+WATER ENG ABUTS Ang Atl Bal Fla Fri Neu/nc Sax/wc
+COAST FLA ABUTS bur Eng FRI lor Neu/nc neu
+LAND FRA ABUTS bav lor swa thu
+COAST FRI ABUTS Eng FLA lor Sax/wc thu wes sax
+COAST GAS ABUTS AQU Atl MOO sep
+COAST LOM ABUTS Med pro SEP swa tra Tus/wc tus
+LAND LOR ABUTS bur fla fra fri swa thu tra
+WATER MED ABUTS Lom Moo Pap Sep Tus/wc
+COAST MOO ABUTS Atl GAS Med SEP
+COAST PAP ABUTS Adr Med Tus/ec Tus/wc tus
+LAND PRO ABUTS aqu bur lom sep tra
+COAST SEP ABUTS aqu gas LOM Med MOO pro
+COAST SER ABUTS Adr ava CRO sla
+COAST SLA ABUTS ava Bal bav Sax/ec ser thu sax
+LAND SWA ABUTS bav fra lom lor tra tus
+LAND THU ABUTS bav fra fri lor sla wes sax
+LAND TRA ABUTS bur lom lor pro swa
+LAND WES ABUTS fri thu sax
+UNOWNED ANG BRE CRO MOO PAP SLA
+EAST (EAST:E) FRA SAX THU
+UNITS
+A FRA
+F SAX/EC
+A THU
+MIDDLE (MIDDLE:I) LOM TRA TUS
+UNITS
+A LOM
+A TRA
+F TUS/EC
+WEST (WEST:W) AQU FLA NEU
+UNITS
+A AQU
+A FLA
+F NEU/NC

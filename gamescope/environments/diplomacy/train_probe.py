@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import shutil
+import pickle
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -140,6 +141,9 @@ def train_linear_probe(X_train: np.ndarray, y_train: np.ndarray) -> LogisticRegr
     return clf
 
 
+ 
+
+
 def evaluate(
     clf: LogisticRegression, X: np.ndarray, y: np.ndarray
 ) -> Tuple[float, float]:
@@ -155,21 +159,26 @@ def main(
     test_size: float,
     seed: int,
     device_arg: Optional[str],
+    model_name: str,
+    output_path: str,
 ):
-    device = torch.device("cuda:1")
+    if device_arg is not None:
+        device = torch.device(device_arg)
+    else:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     logging.basicConfig(
         level=logging.INFO, format="%(message)s"
     )
-    logging.info("Loading DipLLM model %s", MODEL_NAME)
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+    logging.info("Loading model %s", model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
     model = AutoModel.from_pretrained(
-        MODEL_NAME,
+        model_name,
         output_hidden_states=True,
-        device_map=device,
+        device_map="auto",
     )
     if model.config.pad_token_id is None and tokenizer.pad_token_id is not None:
         model.config.pad_token_id = tokenizer.pad_token_id
@@ -203,7 +212,7 @@ def main(
     X_train = scaler.fit_transform(X_train)
     X_test = scaler.transform(X_test)
 
-    logging.info("Training linear probe")
+    logging.info("Training linear (logistic regression) probe")
     clf = train_linear_probe(X_train, y_train)
 
     logging.info("Evaluating")
@@ -221,6 +230,28 @@ def main(
             "test_f1": test_f1,
         }
     )
+
+    # Save probe artifact
+    artifact = {
+        "probe_type": "logreg",
+        "model_name": model_name,
+        "seed": seed,
+        "max_length": max_length,
+        "batch_size": batch_size,
+        "scaler": scaler,
+        "classifier": clf,
+        "metrics": {
+            "train_accuracy": train_acc,
+            "train_f1": train_f1,
+            "test_accuracy": test_acc,
+            "test_f1": test_f1,
+        },
+    }
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("wb") as f:
+        pickle.dump(artifact, f)
+    logging.info("Saved probe to %s", str(out_path))
 
 
 if __name__ == "__main__":
@@ -250,7 +281,20 @@ if __name__ == "__main__":
         "--device",
         type=str,
         default=None,
-        help="Torch device string. Defaults to auto-selecting cuda:1 if available",
+        help="Torch device for input tensors (defaults to cuda:0 if available)",
+    )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="Qwen/Qwen3-4b",
+        help="Hugging Face model name or local path to load",
+    )
+    
+    parser.add_argument(
+        "--output-path",
+        type=str,
+        default="probe.pkl",
+        help="Path to save the trained probe (pickle)",
     )
     args = parser.parse_args()
 
@@ -260,4 +304,6 @@ if __name__ == "__main__":
         test_size=args.test_size,
         seed=args.seed,
         device_arg=args.device,
+        model_name=args.model_name,
+        output_path=args.output_path,
     )
