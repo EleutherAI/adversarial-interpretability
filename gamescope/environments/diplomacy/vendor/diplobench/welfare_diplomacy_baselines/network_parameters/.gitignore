@@ -1,0 +1,5 @@
+# The user should save the parameters for the trained policies into this directory.
+# Files can be found here: https://github.com/hannaherlebach/welfare_diplomacy_baselines
+
+# RL policy weights
+*.npz
